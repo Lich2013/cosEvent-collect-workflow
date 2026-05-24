@@ -1,0 +1,55 @@
+# System Files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Local Configuration & Sensitive Files
+.env
+.env.*
+
+# Project Specific Database & Runtime Directory
+runtime/
+
+# Sensitive Cookies & Session States
+config/cookies/*.json
+# Keep example JSON templates in Git
+!config/cookies/*.example.json
+
+# Test Outputs & Logging
+*.log
+.pytest_cache/
+.coverage
+htmlcov/

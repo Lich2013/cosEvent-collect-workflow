@@ -1,0 +1,20 @@
+[project]
+name = "cosevent-workflow"
+version = "0.1.0"
+description = "Cosplay event collection and LLM-based analysis workflow"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai-agents>=0.6.6",
+    "playwright>=1.57.0",
+    "langfuse>=2.57.0",
+    "click>=8.1.7",
+    "pyyaml>=6.0.1",
+    "jinja2>=3.1.3",
+    "openinference-instrumentation-openai-agents>=0.1.7",
+    "tabulate>=0.9.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+

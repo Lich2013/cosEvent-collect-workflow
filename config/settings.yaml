@@ -1,0 +1,50 @@
+# Local SQLite Database Path
+db_path: "runtime/cosevent.db"
+
+# Playwright Scraper Configuration
+default_limit: 10
+page_load_timeout_seconds: 15
+
+# OpenAI Agent Analysis Configuration
+analyze_confidence_threshold: 0.3
+
+# Local self-hosted Langfuse configuration host
+langfuse_host: "http://localhost:3000"
+
+# ==============================================================================
+# LLM Providers Configuration (Endlines, API Keys, Default Models)
+# ==============================================================================
+llm_providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    default_model: "gpt-4o-mini"
+  
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    default_model: "deepseek-v4-flash"
+
+# ==============================================================================
+# Intelligent Consensus & Triage Analysis Pipeline
+# ==============================================================================
+analysis_pipeline:
+  # Mode: "single" (uses only openai default model), "consensus" (multi-llm extractors + judge)
+  mode: "consensus"
+
+  # Triage model used to pre-filter posts that contain NO events
+  triage_provider: "deepseek"
+  triage_model: "deepseek-v4-flash"
+
+  # Parallel extractors to crawl candidate events (only active when triage returns non-empty)
+  extractors:
+    - provider: "deepseek"
+      model: "deepseek-v4-flash"
+    - provider: "deepseek"
+      model: "deepseek-v4-pro"
+
+  # Final high-reasoning judge that performs fuzzy deduplication, merging, and strict Pydantic output
+  judge:
+    provider: "deepseek"
+    model: "deepseek-v4-pro"
+
