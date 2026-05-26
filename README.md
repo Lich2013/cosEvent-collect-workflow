@@ -1,12 +1,12 @@
 # Cosplay 活动分析收集系统 (cosEvent-workflow)
 
-本项目是一个工程化的、基于 AI 智能体 (Agent) 与网页数据拦截 (Ajax Interception) 技术实现的 **Cosplay 活动信息集中收集与分析提炼系统**。它能够全自动、无头 (Headless) 爬取指定 Coser 在微博、B站、小红书的最新动态，利用 LLM 进行增量智能提炼，识别并格式化活动的时间、地点和详情，并支持一键无乱码导出为 CSV 报表。
+本项目是一个工程化的、基于 AI 智能体 (Agent) 与网页数据拦截 (Ajax Interception) 技术实现的 **Cosplay 活动信息集中收集与分析提炼系统**。它能够全自动、无头 (Headless) 爬取指定 Coser 在微博、B站、小红书的最新动态，利用多大模型共识裁决机制进行增量智能提炼，识别并格式化活动时间、地点与详情，淘汰高危物理删除并全面引入软状态机流转控制，最终支持一键无乱码导出 CSV 报表。
 
 ---
 
 ## 🏗️ 系统整体架构与数据流
 
-本项目遵循 **“异步解耦、增量运行、强契约校验”** 的工程化设计，其核心数据流生命周期图解如下：
+本项目遵循 **“异步解耦、多级版本控制、软状态机对齐、强契约校验”** 的企业级工程化设计，其核心数据流生命周期图解如下：
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -24,21 +24,39 @@
 │         冷启动并自动生成 state.json               无缝还原会话, 爬取完回写     │
 │                 └────────────────────┬────────────────────┘            │
 │                                      ▼                                 │
+│      [数据采集端 - 高精版本化处理]                                     │
+│      - 微博: 提取 edit_count 拼接 #v 后缀;                               │
+│              异步拉取 editHistory API 物理编辑时间以防年份相对日期倒流     │
+│      - B站/小红书: 写入层自动对比 content, 内容发生改变则自动合成          │
+│                    递增 edit_count 并生成 #v 后缀记录                     │
+│                                      │                                 │
+│                                      ▼                                 │
 │                             SQLite `raw_posts` 表                      │
 │                        (UNIQUE 联合去重, is_analyzed=0)                 │
 │                                      │                                 │
 │                                      ▼ [增量分析拉取]                   │
-│                     OpenAI Agent 提取智能体 (Jinja2 Prompts)            │
-│                 ┌────────────────────┴────────────────────┐            │
-│                 ▼ [Pydantic 校验成功]            ▼ [校验失败 (最多3次)]   │
-│           事务原子级写入 cosplay_events,         自适应带着报错重试;     │
-│           并同步更新 raw_posts.is_analyzed = 1   超过3次优雅跳过记录    │
-│                 └────────────────────┬────────────────────┘            │
+│          Multi-LLM 智能共识裁决流水线 (Consensus Pipeline)             │
+│      - 首轮 Triage 预检分流: has_event=False 直接截断退出，将博文标记已分析│
+│      - 多模型并行提取 (Parallel Extract): Concurrently 并发调取 API    │
+│      - 降级旁路裁判 (Judge Bypass): 提取结果为空或仅单侧成功时，自动旁路   │
+│      - 金牌裁判仲裁 (Judge Agent): 高推理大模型执行模糊去重与场馆合并     │
+│                                      │                                 │
 │                                      ▼                                 │
-│                           一键 CSV 双击无乱码导出                      │
+│          核心原子型 SQLite 数据库事务写入层                            │
+│      - 时区硬对齐: 强行对齐为东八区北京时间 (Asia/Shanghai)             │
+│      - 软状态机管理 (Soft State Machine):                              │
+│        * 历史已发生日程: 冷冻保护, 状态保持 '未开始' 且绝对不覆盖          │
+│        * 既存先前版本的未来有效日程: 级联批量更新为 '已取消'             │
+│        * 最新版未来有效日程: 执行增量 Upsert 合并, 默认 '未开始'         │
+│        * 消失在最新分析中的日程: 软注销更新为 '已取消' (取代物理删除)   │
+│      - 对应 raw_posts.is_analyzed 原子的更新为 1                       │
+│                                      │                                 │
+│                                      ▼                                 │
+│             一键 Excel 双击无乱码 CSV 导出 (过滤 '已取消')              │
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
 
 ---
 
@@ -118,8 +136,9 @@ uv run python src/main.py coser add --name "Coser昵称" --weibo "9125039159" --
 # 2. 查看当前 Coser 列表及各平台 UID 绑定状态
 uv run python src/main.py coser list
 
-# 3. 禁用/修改 Coser 状态
-uv run python src/main.py coser update --name "Coser昵称" --active 0
+# 3. 追加绑定各平台 UID 或禁用/启用状态
+# 提示：未指定的选项会保持原有数据不变；若想解绑某个平台，传入空字符串即可 (如 --xhs "")
+uv run python src/main.py coser update --name "Coser昵称" --bili "476566835" --active 1
 
 # 4. 删除 Coser
 uv run python src/main.py coser delete --name "Coser昵称"
@@ -140,9 +159,20 @@ uv run python src/main.py analyze --confidence-threshold 0.3
 uv run python src/main.py process
 ```
 
-#### 🔹 一键无乱码 CSV 导出
+#### 🔹 多格式与多范围精细过滤导出 (Export)
 ```bash
-# 支持 --confidence-threshold 在导出时进行二次精细筛选
-uv run python src/main.py export --output ./results.csv --confidence-threshold 0.8
+# 1. 默认快捷导出 (仅导出“未来及未知”有效日程，直接打印到标准输出 stdout 纯文本预览)
+uv run python src/main.py export
+
+# 2. 导出全量日程至美化纯文本文件
+uv run python src/main.py export --output ./agenda.txt --scope all
+
+# 3. 导出“未来及未知”日程至无乱码 Excel CSV 文件 (置信度精筛 0.8)
+uv run python src/main.py export --output ./results.csv --confidence-threshold 0.8 --scope future
+
+# 4. 支持 Shell 标准管道流重定向
+uv run python src/main.py export --scope future > upcoming_events.txt
 ```
-导出的 CSV 采用 `utf-8-sig` (UTF-8 BOM) 编码，在 Windows 上双击 Excel 直接打开浏览完全无乱码。
+* **时间范围筛选 (`--scope`)**：支持 `future`（默认，仅未来及日期未知的潜在日程）与 `all`（全量历史与未来日程）。
+* **自适应格式智能推理 (`--format` 或后缀)**：支持 `csv` 与 `txt`。若省略，系统会根据 `--output` 后缀自动识别为 CSV 表格（`utf-8-sig` 编码防乱码）或纯文本日程表；当不提供 `--output` 时，默认以优雅文本格式在终端控制台进行打印。
+* **重定向友好**：当直接输出到控制台时，系统将提示语输出到 `stderr`，以防污染你的 Shell 重定向文件内容。

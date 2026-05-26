@@ -1725,3 +1725,271 @@ async def test_weibo_edit_time_anchoring():
     conn.commit()
     conn.close()
 
+
+def test_export_scope_and_format_variants(tmp_path):
+    """测试升级后的 ExportService 多时域范围 (future/all) 及多格式 (csv/txt/stdout) 的过滤与写入正确性"""
+    from src.services.export_service import ExportService
+    
+    # 1. 注册测试 Coser 并插入各种状态的博文与活动记录
+    DBService.add_coser("导出测试Coser")
+    cosers = DBService.list_cosers()
+    coser_id = cosers[0]["id"]
+    
+    # 插入一条博文
+    DBService.save_raw_posts(coser_id, "weibo", [{"post_id": "p_exp_123", "content": "行程发布", "post_url": "url"}])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE post_id = 'p_exp_123';")
+    raw_post_id = cursor.fetchone()[0]
+    
+    # 插入四种不同的 Cosplay 活动（历史、未来、未知、已取消）
+    # 假设当前系统北京参考时间是 2026-05-25
+    cursor.execute(
+        """
+        INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_description, confidence, source_url, status, created_at)
+        VALUES 
+        (?, '导出测试Coser', '过去漫展A', '2025-09-20', '北京', '明日方舟', 0.9, 'url', '未开始', '2026-05-24 12:00:00'),
+        (?, '导出测试Coser', '未来漫展B', '2026-07-01', '上海世博', '原神', 0.8, 'url', '未开始', '2026-05-24 12:00:00'),
+        (?, '导出测试Coser', '待定漫展C', '未知', '广州', '崩铁', 0.75, 'url', '未开始', '2026-05-24 12:00:00'),
+        (?, '导出测试Coser', '已取消漫展D', '2026-08-01', '深圳', '芙宁娜', 0.9, 'url', '已取消', '2026-05-24 12:00:00');
+        """,
+        (raw_post_id, raw_post_id, raw_post_id, raw_post_id)
+    )
+    conn.commit()
+    conn.close()
+    
+    # 2. 验证 scope="all" 获取全量有效记录（过滤已取消）
+    # 应该包含：过去漫展A, 未来漫展B, 待定漫展C = 共 3 条
+    all_txt_file = tmp_path / "all_events.txt"
+    count_all = ExportService.export_events(
+        output_path=str(all_txt_file),
+        confidence_threshold=0.5,
+        scope="all",
+        fmt="txt"
+    )
+    assert count_all == 3
+    
+    # 验证生成的 TXT 文件内容及排版美学
+    with open(all_txt_file, "r", encoding="utf-8") as f:
+        content = f.read()
+        assert "Cosplay 活动日程表 (范围: 全量)" in content
+        assert "过去漫展A" in content
+        assert "未来漫展B" in content
+        assert "待定漫展C" in content
+        assert "已取消漫展D" not in content  # 必须过滤已取消
+        assert "[共成功导出 3 条活动记录]" in content
+        
+    # 3. 验证 scope="future" 仅导出未来及未知（过滤历史和已取消）
+    # 结合参考时间 2026-05-25，应该仅包含：未来漫展B, 待定漫展C = 共 2 条 (2025-09-20 的过去漫展A被过滤)
+    future_csv_file = tmp_path / "future_events.csv"
+    count_future = ExportService.export_events(
+        output_path=str(future_csv_file),
+        confidence_threshold=0.5,
+        scope="future",
+        fmt="csv"
+    )
+    assert count_future == 2
+    
+    # 验证生成的 CSV 文件存在且带有 BOM 标志
+    with open(future_csv_file, "rb") as f:
+        bom = f.read(3)
+        assert bom == b'\xef\xbb\xbf'
+        
+    # 4. 验证省略 output_path 时，自动分流至 stdout 打印纯文本，且自动根据后缀推理格式
+    from unittest.mock import patch
+    with patch("click.echo") as mock_echo:
+        count_stdout = ExportService.export_events(
+            output_path=None,
+            confidence_threshold=0.5,
+            scope="future",
+            fmt=None  # 预期自动推理为 txt
+        )
+        assert count_stdout == 2
+        mock_echo.assert_called_once()
+        stdout_content = mock_echo.call_args[0][0]
+        assert "Cosplay 活动日程表 (范围: 未来及未知)" in stdout_content
+        assert "未来漫展B" in stdout_content
+        assert "待定漫展C" in stdout_content
+        assert "过去漫展A" not in stdout_content
+
+    # 4b. 验证当省略 output_path 且强制 fmt="csv" 时，stdout 流的头部包含 BOM '\ufeff'
+    import io
+    mock_stdout = io.StringIO()
+    with patch("sys.stdout", mock_stdout):
+        count_stdout_csv = ExportService.export_events(
+            output_path=None,
+            confidence_threshold=0.5,
+            scope="future",
+            fmt="csv"
+        )
+        assert count_stdout_csv == 2
+        csv_output = mock_stdout.getvalue()
+        # 验证首字符是 UTF-8 BOM 字符 '\ufeff'
+        assert csv_output.startswith('\ufeff')
+        assert "Coser昵称,活动名称,活动日期,活动地点" in csv_output
+        assert "未来漫展B" in csv_output
+        assert "待定漫展C" in csv_output
+        
+    # 5. 整理清理测试数据
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM cosplay_events WHERE raw_post_id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_event_centric_aggregation_and_fusion():
+    """测试时空融合引擎对模糊名称、滑动日期区间的聚类、融合、LLM裁判缓存及最宽外包络计算"""
+    from src.services.fusion_service import EventFusionService
+    from unittest.mock import patch, AsyncMock
+    
+    # 1. 注册测试 Coser
+    DBService.add_coser("融合测试Coser")
+    cosers = DBService.list_cosers()
+    coser_id = cosers[0]["id"]
+    
+    # 2. 插入测试博文与日程数据
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content, is_analyzed) VALUES (?, ?, ?, ?, ?);", (coser_id, 'weibo', 'p_fuse_11', 'content', 0))
+    raw_post_id = cursor.lastrowid
+    conn.commit()
+    
+    # A. 场景 1：高度匹配 (ratio >= 0.75) 应该直接归一化
+    event_id_1 = EventFusionService.find_or_create_normalized_event(cursor, "Comicup 30", "上海", "2026-05-02")
+    
+    # 再查询 'Comicup30'。相似度 ratio = 0.94，且同城同档期，预期返回同一个 ID
+    event_id_2 = EventFusionService.find_or_create_normalized_event(cursor, "Comicup30", "上海", "2026-05-03")
+    assert event_id_1 == event_id_2
+    
+    # B. 场景 2：临界匹配 (0.5 <= ratio < 0.75) 调用 LLM 裁判并缓存
+    # 'CP30' 与 'Comicup 30' 的相似度 ratio 约为 0.57。
+    with patch("src.services.fusion_service.EventFusionService.run_fusion_judge_agent", new_callable=AsyncMock) as mock_judge:
+        mock_judge.return_value = True
+        
+        event_id_3 = EventFusionService.find_or_create_normalized_event(cursor, "CP30", "上海", "未知")
+        # 验证返回了同一个 ID
+        assert event_id_3 == event_id_1
+        mock_judge.assert_called_once()
+        
+        # 验证别名缓存已被成功写入。第二次查询 'CP30' 时，预期直接命中缓存，不触发 LLM
+        mock_judge.reset_mock()
+        event_id_4 = EventFusionService.find_or_create_normalized_event(cursor, "CP30", "上海", "2026-05-03")
+        assert event_id_4 == event_id_1
+        mock_judge.assert_not_called()
+
+    # C. 场景 3：时间包络计算
+    # 模拟在 cosplay_events 中插入三条实际日程，关联到此超级节点
+    cursor.execute(
+        """
+        INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, status, normalized_event_id)
+        VALUES 
+        (?, '融合测试Coser', 'Comicup 30', '2026-05-02', '上海新国际', '未开始', ?),
+        (?, '融合测试Coser', 'Comicup30', '2026-05-03', '上海新国际', '未开始', ?),
+        (?, '融合测试Coser', 'CP30', '未知', '上海新国际', '未开始', ?);
+        """,
+        (raw_post_id, event_id_1, raw_post_id, event_id_1, raw_post_id, event_id_1)
+    )
+    # 触发包络计算
+    EventFusionService.update_event_bounding_box(cursor, event_id_1)
+    
+    # 验证超级漫展节点的最大日期外包络区间已被正确计算为 2026-05-02 至 2026-05-03 (过滤了'未知')
+    cursor.execute("SELECT start_date, end_date FROM normalized_events WHERE id = ?;", (event_id_1,))
+    row = cursor.fetchone()
+    assert row[0] == "2026-05-02"
+    assert row[1] == "2026-05-03"
+    
+    # D. 场景 4：不同届或不同城市的超级漫展应该被隔离
+    event_id_gz = EventFusionService.find_or_create_normalized_event(cursor, "CP30", "广州", "2026-05-02")
+    assert event_id_gz != event_id_1
+    
+    # 物理清除测试数据
+    cursor.execute("DELETE FROM cosplay_events WHERE raw_post_id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    cursor.execute("DELETE FROM normalized_events WHERE id IN (?, ?);", (event_id_1, event_id_gz))
+    cursor.execute("DELETE FROM event_aliases WHERE normalized_event_id IN (?, ?);", (event_id_1, event_id_gz))
+    conn.commit()
+    conn.close()
+
+
+def test_cli_summary_by_event_and_calendar(tmp_path):
+    """测试通过 Click 运行 summary --by-event, calendar, export --view calendar 等命令的流畅度与对齐"""
+    from click.testing import CliRunner
+    from src.main import cli
+    
+    # 1. 注册测试 Coser
+    DBService.add_coser("CLI测试Coser")
+    cosers = DBService.list_cosers()
+    coser_id = cosers[0]["id"]
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content, is_analyzed) VALUES (?, ?, ?, ?, ?);", (coser_id, 'weibo', 'p_cli_11', 'content', 0))
+    raw_post_id = cursor.lastrowid
+    
+    # 2. 插入测试超级漫展节点及关联日程
+    cursor.execute(
+        """
+        INSERT INTO normalized_events (id, event_fingerprint, standard_name, city, start_date, end_date)
+        VALUES (999, 'shanghai_cp30_test', 'Comicup 30', '上海', '2029-05-02', '2029-05-03');
+        """
+    )
+    cursor.execute(
+        """
+        INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, status, confidence, normalized_event_id)
+        VALUES (?, 'CLI测试Coser', 'Comicup 30', '2029-05-02', '上海国家会展中心', '未开始', 0.9, 999);
+        """,
+        (raw_post_id,)
+    )
+    conn.commit()
+    conn.close()
+    
+    runner = CliRunner()
+    
+    # 3. 验证 summary --by-event 看板命令
+    res_summary = runner.invoke(cli, ["summary", "--by-event"])
+    assert res_summary.exit_code == 0
+    assert "超级漫展集结看板" in res_summary.output
+    assert "Comicup 30" in res_summary.output
+    assert "CLI测试Coser" in res_summary.output
+    
+    # 4. 验证 calendar 日历看板命令
+    res_cal = runner.invoke(cli, ["calendar", "--city", "上海", "--scope", "future"])
+    assert res_cal.exit_code == 0
+    assert "二次元 [上海] 漫展展讯日历看板" in res_cal.output
+    assert "Comicup 30" in res_cal.output
+    
+    # 5. 验证 export --view calendar 导出 Markdown 表格文件及 BOM CSV
+    md_file = tmp_path / "events_cal.md"
+    res_exp_md = runner.invoke(cli, ["export", "--view", "calendar", "--output", str(md_file)])
+    assert res_exp_md.exit_code == 0
+    assert md_file.exists()
+    with open(md_file, "r", encoding="utf-8") as f:
+        md_content = f.read()
+        assert "二次元超级漫展排期日历看板" in md_content
+        assert "| 日期 | 城市 | 漫展名称 |" in md_content
+        assert "Comicup 30" in md_content
+        
+    csv_file = tmp_path / "events_cal.csv"
+    res_exp_csv = runner.invoke(cli, ["export", "--view", "calendar", "--output", str(csv_file)])
+    assert res_exp_csv.exit_code == 0
+    assert csv_file.exists()
+    with open(csv_file, "rb") as f:
+        bom = f.read(3)
+        assert bom == b'\xef\xbb\xbf'
+        
+    # 6. 物理清除测试数据
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM cosplay_events WHERE raw_post_id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    cursor.execute("DELETE FROM normalized_events WHERE id = 999;")
+    conn.commit()
+    conn.close()
+
+

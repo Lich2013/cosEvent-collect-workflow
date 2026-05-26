@@ -5,49 +5,28 @@ import json
 import asyncio
 import re
 from pathlib import Path
-from jinja2 import Template
 from pydantic import ValidationError
 from agents import Agent, Runner, RunConfig
 from src.models.schemas import FinalOutput, TriageOutput
 from src.config import settings
-from src.tools.llm_bridge import LLMClientRegistry, RegistryModelProvider
-
-# 初始化全局连接池和 ModelProvider 适配器
-llm_registry = LLMClientRegistry(settings.llm_providers)
-registry_model_provider = RegistryModelProvider(llm_registry)
-
+from src.utils.llm_factory import registry_model_provider
+from src.utils.templates import render_instruction_template
 from src.utils.logger import log_event
 
 def get_rendered_instructions(template_name: str = "event_analysis.jinja2") -> str:
     """动态读取并使用 Jinja2 模板渲染 System Prompt，注入当前系统参考时间"""
-    template_path = settings.PROJECT_ROOT / "config" / "templates" / template_name
-    if not template_path.exists():
-        raise FileNotFoundError(f"Jinja2 模板不存在: {template_path}")
-        
-    with open(template_path, "r", encoding="utf-8") as f:
-        template_str = f.read()
-        
-    template = Template(template_str)
-    beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-    current_date = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d")
-    return template.render(current_date=current_date)
+    return render_instruction_template(template_name)
 
-async def analyze_post_with_retry(content: str, url: str, published_at: str | None = None) -> list:
+class AgentPipeline:
     """
-    使用官方原生 openai-agents SDK 执行提炼任务。
-    支持 settings.yaml 配置的单模型提取 (single) 和多模型共识裁决 (consensus) 两种流水线。
+    智能体分析提取流水线 (Pipeline Pattern)：
+    将多模型共识裁决 (Consensus) 及单模型直接提取 (Single) 流程对象化封装，增强可读性与可测试性。
     """
-    mode = settings.analysis_pipeline.get("mode", "single")
-    input_text = ""
-    if published_at:
-        input_text += f"博文发布时间:\n{published_at}\n\n"
-    input_text += f"博文正文:\n{content}\n\n原帖链接:\n{url}"
-    run_cfg = RunConfig(model_provider=registry_model_provider)
+    def __init__(self):
+        self.run_cfg = RunConfig(model_provider=registry_model_provider)
 
-    # ==============================================================================
-    # 模式一：多模型共识裁决与预检分流流水线 (Consensus Mode)
-    # ==============================================================================
-    if mode == "consensus":
+    async def run_consensus_pipeline(self, content: str, url: str, published_at: str | None, input_text: str) -> list:
+        """多模型共识裁决与首轮预检分流流水线"""
         # 1. 快速分流过滤 (Triage Filter)
         triage_prov = settings.analysis_pipeline.get("triage_provider", "openai")
         triage_mod = settings.analysis_pipeline.get("triage_model", "gpt-4o-mini")
@@ -55,7 +34,7 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
         
         triage_agent = Agent(
             name="triage_analyzer",
-            instructions="你是一个 Cosplay 活动初筛专家。请评估博文内容，判断博主是否发布了未来的漫展计划、签售出行、排班表或快闪计划。必须严格遵循规定的 Pydantic 强契约输出。",
+            instructions="你是一个 Cosplay 活动初筛专家。请评估博文内容，判断博主是否发布了未来的漫展计划、一日店长（罗森店长等）、摄影会、受邀到店模特、签售出行、排班表或快闪计划。必须严格遵循规定的 Pydantic 强契约输出。",
             output_type=TriageOutput,
             model=triage_model_spec
         )
@@ -68,7 +47,7 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
             triage_res = await Runner.run(
                 triage_agent,
                 triage_input,
-                run_config=run_cfg
+                run_config=self.run_cfg
             )
             triage_data = triage_res.final_output
             
@@ -98,7 +77,7 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
             res = await Runner.run(
                 extractor_agent,
                 input_text,
-                run_config=run_cfg
+                run_config=self.run_cfg
             )
             return res.final_output
 
@@ -177,7 +156,7 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
                 result = await Runner.run(
                     judge_agent,
                     feedback_prompt,
-                    run_config=run_cfg
+                    run_config=self.run_cfg
                 )
                 final_data = result.final_output
                 if final_data and hasattr(final_data, "event_list"):
@@ -199,11 +178,10 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
                     return fallback_events
                 
                 feedback_prompt = f"{judge_prompt}\n\n⚠️ 【系统反馈：你上一次提取未通过 Pydantic 强校验，报错如下。请绝对依据错误修正输出格式】\n{str(e)}"
+        return []
 
-    # ==============================================================================
-    # 模式二：单模型提取模式 (Single Model Mode - 保持向下兼容)
-    # ==============================================================================
-    else:
+    async def run_single_pipeline(self, content: str, url: str, published_at: str | None, input_text: str) -> list:
+        """单模型分析直接提取流水线"""
         instructions = get_rendered_instructions()
         agent = Agent(
             name="cosplay_event_analyzer",
@@ -218,8 +196,7 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
             try:
                 print(f"\x1b[1;34m[Agent] 启动 AI 增量分析 (尝试 {attempt}/{max_retries})...\x1b[0m")
                 
-                # 指定单模型进行执行
-                result = await Runner.run(agent, feedback_prompt, run_config=run_cfg)
+                result = await Runner.run(agent, feedback_prompt, run_config=self.run_cfg)
                 final_data = result.final_output
                 if final_data and hasattr(final_data, "event_list"):
                     events = [event.model_dump() for event in final_data.event_list]
@@ -238,4 +215,21 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
                     raise e
                 feedback_prompt = f"{input_text}\n\n⚠️ 【系统反馈：你上一次提取未通过 Pydantic 强校验，报错如下。请绝对依据错误修正输出格式】\n{str(e)}"
                 
-    return []
+        return []
+
+async def analyze_post_with_retry(content: str, url: str, published_at: str | None = None) -> list:
+    """
+    使用官方原生 openai-agents SDK 执行提炼任务。
+    支持 settings.yaml 配置的单模型提取 (single) 和多模型共识裁决 (consensus) 两种流水线。
+    """
+    mode = settings.analysis_pipeline.get("mode", "single")
+    input_text = ""
+    if published_at:
+        input_text += f"博文发布时间:\n{published_at}\n\n"
+    input_text += f"博文正文:\n{content}\n\n原帖链接:\n{url}"
+
+    pipeline = AgentPipeline()
+    if mode == "consensus":
+        return await pipeline.run_consensus_pipeline(content, url, published_at, input_text)
+    else:
+        return await pipeline.run_single_pipeline(content, url, published_at, input_text)

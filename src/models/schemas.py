@@ -23,6 +23,10 @@ class CosEvent(BaseModel):
         ..., 
         description="大模型对提取内容的确定性置信度评分，取值范围在 0.0 至 1.0 之间"
     )
+    event_type: str = Field(
+        default="漫展",
+        description="活动的类型分类。取值范围必须为: '漫展', '一日店长', '摄影会', '受邀模特', '快闪/签售'"
+    )
     source_url: str = Field(
         ..., 
         description="提取该活动的原始博文源链接地址"
@@ -44,4 +48,19 @@ class TriageOutput(BaseModel):
     candidate_events: List[str] = Field(
         default=[],
         description="博文里提到的未来活动主题候选名称列表（如果 has_event 为 False 则为空列表）"
+    )
+
+class FusionJudgeOutput(BaseModel):
+    """超级漫展同义融合裁判智能体输出契约"""
+    is_same: bool = Field(
+        ...,
+        description="事件A与事件B在现实中是否为同一个二次元漫展/同人祭/动漫嘉年华活动"
+    )
+    confidence: float = Field(
+        ...,
+        description="对于此判定的置信度评分，0.0 至 1.0 之间"
+    )
+    reason: str = Field(
+        ...,
+        description="判定的核心依据与逻辑推理理由（如缩写对齐、中英文别名等）"
     )

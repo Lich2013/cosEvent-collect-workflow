@@ -44,7 +44,7 @@ def init_db():
         );
         """)
         
-        # 3. 创建 cosplay_events 表 (外键关联 raw_posts.id)
+        # 3. 创建 cosplay_events 表 (外键关联 raw_posts.id, normalized_events.id)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS cosplay_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,13 +57,45 @@ def init_db():
             confidence REAL DEFAULT 1.0,
             source_url TEXT,
             status TEXT DEFAULT '未开始',
+            normalized_event_id INTEGER,
+            event_type TEXT DEFAULT '漫展',
             created_at TEXT,
             FOREIGN KEY(raw_post_id) REFERENCES raw_posts(id) ON DELETE CASCADE,
-            CHECK (status IN ('未开始', '已结束', '已取消'))
+            FOREIGN KEY(normalized_event_id) REFERENCES normalized_events(id) ON DELETE SET NULL,
+            CHECK (status IN ('未开始', '已结束', '已取消')),
+            CHECK (event_type IN ('漫展', '一日店长', '摄影会', '受邀模特', '快闪/签售'))
+        );
+        """)
+
+        # 4. 创建 normalized_events 表
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS normalized_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_fingerprint TEXT UNIQUE,
+            standard_name TEXT NOT NULL,
+            city TEXT NOT NULL,
+            start_date TEXT,
+            end_date TEXT,
+            event_type TEXT DEFAULT '漫展',
+            created_at TEXT,
+            CHECK (event_type IN ('漫展', '一日店长', '摄影会', '受邀模特', '快闪/签售'))
+        );
+        """)
+
+        # 5. 创建 event_aliases 表 (外键关联 normalized_events.id)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS event_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias_name TEXT NOT NULL,
+            city TEXT NOT NULL,
+            normalized_event_id INTEGER NOT NULL,
+            created_at TEXT,
+            FOREIGN KEY(normalized_event_id) REFERENCES normalized_events(id) ON DELETE CASCADE,
+            UNIQUE(alias_name, city)
         );
         """)
         
-        # 4. 自动数据库热升级：检测并追加新列以支持微博编辑次数与发表时间控制
+        # 6. 自动数据库热升级：检测并追加新列以支持微博编辑次数与发表时间控制
         cursor.execute("PRAGMA table_info(raw_posts);")
         columns = [col[1] for col in cursor.fetchall()]
         
@@ -75,15 +107,28 @@ def init_db():
             cursor.execute("ALTER TABLE raw_posts ADD COLUMN published_at TEXT;")
             print("\x1b[1;32m[Database Migration] 成功为 raw_posts 表追加 published_at 列。\x1b[0m")
             
-        # 自动为 cosplay_events 检测并追加 status 字段
+        # 自动为 cosplay_events 检测并追加 status 与 normalized_event_id 字段
         cursor.execute("PRAGMA table_info(cosplay_events);")
         ce_columns = [col[1] for col in cursor.fetchall()]
         if "status" not in ce_columns:
             cursor.execute("ALTER TABLE cosplay_events ADD COLUMN status TEXT DEFAULT '未开始';")
             print("\x1b[1;32m[Database Migration] 成功为 cosplay_events 表追加 status 列。\x1b[0m")
+        if "normalized_event_id" not in ce_columns:
+            cursor.execute("ALTER TABLE cosplay_events ADD COLUMN normalized_event_id INTEGER REFERENCES normalized_events(id) ON DELETE SET NULL;")
+            print("\x1b[1;32m[Database Migration] 成功为 cosplay_events 表追加 normalized_event_id 列。\x1b[0m")
+        if "event_type" not in ce_columns:
+            cursor.execute("ALTER TABLE cosplay_events ADD COLUMN event_type TEXT DEFAULT '漫展';")
+            print("\x1b[1;32m[Database Migration] 成功为 cosplay_events 表追加 event_type 列。\x1b[0m")
+
+        # 自动为 normalized_events 检测并追加 event_type 字段
+        cursor.execute("PRAGMA table_info(normalized_events);")
+        ne_columns = [col[1] for col in cursor.fetchall()]
+        if "event_type" not in ne_columns:
+            cursor.execute("ALTER TABLE normalized_events ADD COLUMN event_type TEXT DEFAULT '漫展';")
+            print("\x1b[1;32m[Database Migration] 成功为 normalized_events 表追加 event_type 列。\x1b[0m")
             
         conn.commit()
-        print("\x1b[1;32m[Database] 数据库表结构初始化成功。\x1b[0m")
+        print("\x1b[1;32m[Database] 数据库表结构初始化及迁移升级成功。\x1b[0m")
     except Exception as e:
         conn.rollback()
         print(f"\x1b[1;31m[Database] 数据库表结构初始化失败: {e}\x1b[0m")
