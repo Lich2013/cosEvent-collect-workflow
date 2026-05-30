@@ -27,8 +27,9 @@
 │      [数据采集端 - 高精版本化处理]                                     │
 │      - 微博: 提取 edit_count 拼接 #v 后缀;                               │
 │              异步拉取 editHistory API 物理编辑时间以防年份相对日期倒流     │
-│      - B站/小红书: 写入层自动对比 content, 内容发生改变则自动合成          │
-│                    递增 edit_count 并生成 #v 后缀记录                     │
+│      - B站: 双模自适应采集（gRPC优先+网页降级）。使用 gRPC 时由物理编辑时间│
+│             进行高精版本化与事务去重，网页抓取时以内容变动驱动自适应合成    │
+│      - 小红书: 写入层对比 content，内容发生改变则自动合成递增版本记录       │
 │                                      │                                 │
 │                                      ▼                                 │
 │                             SQLite `raw_posts` 表                      │
@@ -127,6 +128,7 @@ cp .env.example .env
 # 编辑 .env 文件，填入：
 # OPENAI_API_KEY, OPENAI_API_BASE
 # LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST (默认为 http://localhost:3000)
+# BILIBILI_ACCESS_TOKEN, BILIBILI_MID (B 站移动端第一方 gRPC 凭证，若缺失将自动降级为 Playwright 网页抓取)
 ```
 
 > ⚠️ **安全警示**：为了防止 API Key 随 Git 泄露，请务必在 `config/settings.yaml` 中使用 `api_key: "${ENV_VAR}"` 环境变量占位符语法，并将真实的密钥配置在 `.env` 或系统环境变量中！请勿将明文 API Key 直接写入 YAML 配置文件中！
@@ -173,9 +175,11 @@ uv run python src/main.py coser sync-bili --dry-run
 #### 🔹 执行数据采集与分析提炼
 本系统在物理和逻辑上支持完全的爬行与分析解耦：
 ```bash
-# 1. 独立爬行任务 (拉取所有 active Coser 博文，存入数据库并 UNIQUE 去重)
+# 1. 独立爬行任务 (拉取活跃 Coser 博文，存入数据库并 UNIQUE 去重)
 # 支持通过 --limit 限制单平台拉取数 (默认 10)
-uv run python src/main.py scrape --limit 10
+# 支持通过 --name 过滤特定 Coser 姓名
+# 支持通过 --platform 过滤特定平台 (weibo/bilibili/xhs/all，默认 all)
+uv run python src/main.py scrape --limit 10 --name "池咲misa" --platform bilibili
 
 # 2. 独立分析任务 (增量拉取未处理博文，大模型分析，事务原子级录入 events 并标记状态)
 # 支持通过 --confidence-threshold 过滤基准置信度 (默认 0.3)
@@ -184,6 +188,7 @@ uv run python src/main.py analyze --confidence-threshold 0.3
 # 3. 统一调度进程 (依次顺序调用以上两者，完成闭环，输出漂亮的四色总结报告)
 uv run python src/main.py process
 ```
+* **细粒度过滤 (`--name` / `--platform`)**：在数据爬取阶段，你可以通过指定 `--name` 匹配特定的 Coser，指定 `--platform` 匹配特定的社交平台，系统将自动裁剪执行任务，旁路无需运行的 Scraper 实例和 Playwright 浏览器会话，大幅提升单点调试与更新的效率。不提供参数时自动回退为全量并发爬行。
 
 #### 🔹 多格式与多范围精细过滤导出 (Export)
 ```bash
