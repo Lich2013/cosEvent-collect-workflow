@@ -1,12 +1,12 @@
 # Cosplay 活动分析收集系统 (cosEvent-workflow)
 
-本项目是一个工程化的、基于 AI 智能体 (Agent) 与网页数据拦截 (Ajax Interception) 技术实现的 **Cosplay 活动信息集中收集与分析提炼系统**。它能够全自动、无头 (Headless) 爬取指定 Coser 在微博、B站、小红书的最新动态，利用多大模型共识裁决机制进行增量智能提炼，识别并格式化活动时间、地点与详情，淘汰高危物理删除并全面引入软状态机流转控制，最终支持一键无乱码导出 CSV 报表。
+本项目是一个工程化的、基于 AI 智能体 (Agent) 与网页数据拦截 (Ajax Interception) 技术实现的 **Cosplay 活动信息集中收集、分析提炼与智能聚合系统**。它能够全自动、无头 (Headless) 爬取指定 Coser 在微博、B站、小红书的最新动态，利用多大模型共识裁决机制进行增量智能提炼，识别并格式化活动时间、地点与详情，通过时空聚类引擎自动将不同 Coser 的同场漫展归并为规范化超级节点，淘汰高危物理删除并全面引入软状态机流转控制，最终支持一键无乱码导出 CSV 报表与多维日历看板查询。
 
 ---
 
 ## 🏗️ 系统整体架构与数据流
 
-本项目遵循 **“异步解耦、多级版本控制、软状态机对齐、强契约校验”** 的企业级工程化设计，其核心数据流生命周期图解如下：
+本项目遵循 **"异步解耦、多级版本控制、软状态机对齐、时空智能聚合、强契约校验"** 的企业级工程化设计，其核心数据流生命周期图解如下：
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -52,7 +52,16 @@
 │      - 对应 raw_posts.is_analyzed 原子的更新为 1                       │
 │                                      │                                 │
 │                                      ▼                                 │
-│             一键 Excel 双击无乱码 CSV 导出 (过滤 '已取消')              │
+│          智能时空聚类引擎 → `normalized_events` 超级节点              │
+│      - 时空粗筛: 同城 + 日期差 ≤3 天进入比对                          │
+│      - 双阈值融合: R≥0.75 直接合并; 0.5≤R<0.75 触发轻量 Judge 裁决   │
+│        (裁决结果物理缓存别名表, 后续命中旁路裁判 Agent)                 │
+│      - 非漫展小众活动 (一日店长/摄影会等): 100% 旁路融合引擎,           │
+│        直接生成独立超级节点, 切断大型漫展指纹库污染                     │
+│      - start_date/end_date 自动包络融合为所有关联日期的 min/max        │
+│                                      │                                 │
+│                                      ▼                                 │
+│   CSV 导出 (过滤 '已取消') │ summary --by-event │ calendar           │
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -136,13 +145,30 @@ uv run python src/main.py coser add --name "Coser昵称" --weibo "9125039159" --
 # 2. 查看当前 Coser 列表及各平台 UID 绑定状态
 uv run python src/main.py coser list
 
-# 3. 追加绑定各平台 UID 或禁用/启用状态
-# 提示：未指定的选项会保持原有数据不变；若想解绑某个平台，传入空字符串即可 (如 --xhs "")
-uv run python src/main.py coser update --name "Coser昵称" --bili "476566835" --active 1
+# 3. 禁用/修改 Coser 状态
+uv run python src/main.py coser update --name "Coser昵称" --active 0
 
 # 4. 删除 Coser
 uv run python src/main.py coser delete --name "Coser昵称"
 ```
+
+#### 🔹 智能 B站 UID 自动同步 (Sync Bili)
+
+针对数据库中尚未绑定 B站 UID 的活跃 Coser，自动通过 B站搜索 API 批量检索候选账号，并利用启发式打分算法（昵称相似度 + Bio 关键词交叉验证）智能匹配并回写正确 UID：
+```bash
+# 1. 全自动批量同步 (默认上限 10 人)
+uv run python src/main.py coser sync-bili
+
+# 2. 指定本次最多同步 5 位 Coser
+uv run python src/main.py coser sync-bili --limit 5
+
+# 3. 预演模式：仅打印匹配分析报告，不修改数据库
+uv run python src/main.py coser sync-bili --dry-run
+```
+
+* **`--limit N`**：限制本次最大同步人数配额，防止一次性消耗过多 API 资源，默认 10。
+* **`--dry-run`**：仅执行搜索与启发式打分，输出候选对比报告，不写入数据库，适合在正式同步前人工审核结果。
+* **批量复用会话**：所有 Coser 的检索在单次 Playwright 浏览器会话中完成，避免重复冷启动开销。
 
 #### 🔹 执行数据采集与分析提炼
 本系统在物理和逻辑上支持完全的爬行与分析解耦：
@@ -176,3 +202,43 @@ uv run python src/main.py export --scope future > upcoming_events.txt
 * **时间范围筛选 (`--scope`)**：支持 `future`（默认，仅未来及日期未知的潜在日程）与 `all`（全量历史与未来日程）。
 * **自适应格式智能推理 (`--format` 或后缀)**：支持 `csv` 与 `txt`。若省略，系统会根据 `--output` 后缀自动识别为 CSV 表格（`utf-8-sig` 编码防乱码）或纯文本日程表；当不提供 `--output` 时，默认以优雅文本格式在终端控制台进行打印。
 * **重定向友好**：当直接输出到控制台时，系统将提示语输出到 `stderr`，以防污染你的 Shell 重定向文件内容。
+
+#### 🔹 漫展集结看板 (Summary)
+
+以归一化漫展超级节点为中心，纵览各漫展的完整集结阵容：
+```bash
+# 1. 默认视角：按 Coser 展示全量日程
+uv run python src/main.py summary
+
+# 2. 漫展视角：以超级漫展节点为外层，嵌套展示参展 Coser 信息、扮演角色与摊位
+uv run python src/main.py summary --by-event
+
+# 3. 按活动类型精筛 (可与 --by-event 组合使用)
+uv run python src/main.py summary --by-event --type 一日店长
+uv run python src/main.py summary --type 摄影会
+```
+
+* **`--by-event`**：切换为以归一化漫展（`normalized_events`）为大节点的层次化视图，嵌套展示各漫展下所有参展 Coser 的昵称、日期、扮演角色与摊位号（完全通过数据库物理联查，零 LLM 幻觉）。
+* **`--type`**：支持 `漫展`、`一日店长`、`摄影会`、`受邀模特`、`快闪/签售` 五类精筛过滤，省略时默认输出全量日程。
+
+#### 🔹 时间轴日历看板 (Calendar)
+
+纯粹以"时间 + 空间"为维度查询高价值漫展排期，按月份多级聚合呈现：
+```bash
+# 1. 默认：查看所有城市的未来标准漫展排期
+uv run python src/main.py calendar
+
+# 2. 按城市过滤
+uv run python src/main.py calendar --city 上海
+
+# 3. 查看全量历史与未来漫展
+uv run python src/main.py calendar --scope all
+
+# 4. 查看特定小众活动类型的日历
+uv run python src/main.py calendar --type 一日店长 --scope all
+```
+
+* **`--city`**：仅展示指定城市的漫展节点，省略时展示全国。
+* **`--scope`**：`future`（默认，仅保留 `end_date >= 今日` 或日期未知的节点）/ `all`（含历史全量）。
+* **`--type`**：默认值为 `漫展`，可切换为 `一日店长`、`摄影会` 等小众类型，实现大型漫展与小众活动的视觉分流。
+* **输出格式**：按举办月份物理分组（如 `2026年5月`），月份内按日期升序排列，每个漫展节点显示名称、时间范围、城市场馆，以及 `👥 已集结 N 位 Coser` 的参展人数统计。

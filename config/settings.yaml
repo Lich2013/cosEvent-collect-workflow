@@ -48,3 +48,11 @@ analysis_pipeline:
     provider: "deepseek"
     model: "deepseek-v4-pro"
 
+# ==============================================================================
+# Bilibili gRPC First-Party API Credentials
+# ==============================================================================
+bilibili_grpc:
+  access_token: "${BILIBILI_ACCESS_TOKEN}"
+  mid: "${BILIBILI_MID}"
+
+

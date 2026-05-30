@@ -70,7 +70,7 @@ def test_database_transaction_atomicity():
     """
     测试核心原子性事务：
     如果在批量插入活动时某一条报错（如 event_name 违反 NOT NULL 约束），
-    整个写入必须 Rollback，且原始博文的 is_analyzed 状态必须依然为 0。
+    整个写入必须 Rollback 并抛出结构性异常。
     """
     DBService.add_coser("事务Coser")
     cosers = DBService.list_cosers()
@@ -79,14 +79,14 @@ def test_database_transaction_atomicity():
     # 插入一条博文
     DBService.save_raw_posts(coser_id, "weibo", [{"post_id": "p888", "content": "漫展计划", "post_url": "url888"}])
     
-    # 获取插入的 raw_post_id
+    # 获取插入 the raw_post_id
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM raw_posts WHERE post_id = 'p888';")
     raw_post_id = cursor.fetchone()[0]
     conn.close()
     
-    # 构造一批提取出的活动，其中第 2 条没有 event_name（设为 None），会触发 SQLite 的 NOT NULL 异常
+    # 构造一批提取出的活动，其中第 2 条没有 event_name（设为 None），会触发 SQLite 的 NOT NULL 异常或 Python 类型错误
     events = [
         {
             "event_name": "合法漫展A",
@@ -97,7 +97,7 @@ def test_database_transaction_atomicity():
             "source_url": "url888"
         },
         {
-            "event_name": None, # 异常数据！触发 SQLite NOT NULL 报错，引起回滚
+            "event_name": None, # 异常数据！触发 SQLite NOT NULL 报错或 Python 类型错误
             "event_date": "2026-07-02",
             "event_place": "上海世博馆",
             "event_description": "崩铁",
@@ -106,9 +106,10 @@ def test_database_transaction_atomicity():
         }
     ]
     
-    # 执行原子事务保存，预期应该失败返回 False，并且执行回滚
-    success = DBService.save_extracted_events_transactional(raw_post_id, events, confidence_threshold=0.3)
-    assert success is False
+    # 执行原子事务保存，预期应该触发结构性永久异常并执行回滚
+    import sqlite3
+    with pytest.raises((sqlite3.IntegrityError, TypeError, ValueError, AttributeError)):
+        DBService.save_extracted_events_transactional(raw_post_id, events, confidence_threshold=0.3)
     
     # 验证数据库数据完整性：没有新活动存入，并且 is_analyzed 依然为 0
     conn = get_db_connection()
@@ -1534,8 +1535,9 @@ async def test_sqlite_check_constraint_status():
             "status": "已取销"  # 错误的拼写
         }
     ]
-    # 我们故意绕过提取框架，模拟异常插入。因为应用层校验，应抛出 AssertionError 或 IntegrityError
-    assert DBService.save_extracted_events_transactional(raw_post_id, invalid_events, 0.3) is False
+    # 我们故意绕过提取框架，模拟异常插入。因为应用层强校验，应重新抛出 AssertionError 激活熔断机制
+    with pytest.raises(AssertionError):
+        DBService.save_extracted_events_transactional(raw_post_id, invalid_events, 0.3)
 
 
 @pytest.mark.asyncio
@@ -1865,19 +1867,19 @@ def test_event_centric_aggregation_and_fusion():
     event_id_2 = EventFusionService.find_or_create_normalized_event(cursor, "Comicup30", "上海", "2026-05-03")
     assert event_id_1 == event_id_2
     
-    # B. 场景 2：临界匹配 (0.5 <= ratio < 0.75) 调用 LLM 裁判并缓存
-    # 'CP30' 与 'Comicup 30' 的相似度 ratio 约为 0.57。
+    # B. 场景 2：临界匹配 (0.2 <= ratio < 0.75) 调用 LLM 裁判并缓存
+    # 'C30' 与 'Comicup 30' 的相似度 ratio 约为 0.5。
     with patch("src.services.fusion_service.EventFusionService.run_fusion_judge_agent", new_callable=AsyncMock) as mock_judge:
         mock_judge.return_value = True
         
-        event_id_3 = EventFusionService.find_or_create_normalized_event(cursor, "CP30", "上海", "未知")
+        event_id_3 = EventFusionService.find_or_create_normalized_event(cursor, "C30", "上海", "未知")
         # 验证返回了同一个 ID
         assert event_id_3 == event_id_1
         mock_judge.assert_called_once()
         
-        # 验证别名缓存已被成功写入。第二次查询 'CP30' 时，预期直接命中缓存，不触发 LLM
+        # 验证别名缓存已被成功写入。第二次查询 'C30' 时，预期直接命中缓存，不触发 LLM
         mock_judge.reset_mock()
-        event_id_4 = EventFusionService.find_or_create_normalized_event(cursor, "CP30", "上海", "2026-05-03")
+        event_id_4 = EventFusionService.find_or_create_normalized_event(cursor, "C30", "上海", "2026-05-03")
         assert event_id_4 == event_id_1
         mock_judge.assert_not_called()
 
@@ -1889,7 +1891,7 @@ def test_event_centric_aggregation_and_fusion():
         VALUES 
         (?, '融合测试Coser', 'Comicup 30', '2026-05-02', '上海新国际', '未开始', ?),
         (?, '融合测试Coser', 'Comicup30', '2026-05-03', '上海新国际', '未开始', ?),
-        (?, '融合测试Coser', 'CP30', '未知', '上海新国际', '未开始', ?);
+        (?, '融合测试Coser', 'C30', '未知', '上海新国际', '未开始', ?);
         """,
         (raw_post_id, event_id_1, raw_post_id, event_id_1, raw_post_id, event_id_1)
     )
@@ -1991,5 +1993,512 @@ def test_cli_summary_by_event_and_calendar(tmp_path):
     cursor.execute("DELETE FROM normalized_events WHERE id = 999;")
     conn.commit()
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_analyzer_breaker_permanent_failure():
+    """测试三态熔断器对永久性/结构性故障的拦截与熔断升级"""
+    # 1. 注册一个测试 coser 和博文
+    DBService.add_coser("熔断测试姬")
+    cosers = DBService.list_cosers()
+    coser_id = [c["id"] for c in cosers if c["name"] == "熔断测试姬"][0]
+    
+    posts = [{
+        "post_id": "breaker_post_111",
+        "content": "漫展行程",
+        "post_url": "url",
+        "edit_count": 0,
+        "published_at": None
+    }]
+    DBService.save_raw_posts(coser_id, "xhs", posts)
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE platform = 'xhs' AND post_id = 'breaker_post_111';")
+    raw_post_id = cursor.fetchone()[0]
+    conn.close()
+    
+    # 2. Mock 提取引擎 analyze_post_with_retry 返回一个包含非法状态的活动（触发 AssertionError）
+    # 在 run_analyze 中运行，验证其被拦截并标记 is_analyzed = 2
+    from unittest.mock import patch
+    invalid_events = [
+        {
+            "event_name": "熔断漫展",
+            "event_date": "2026-06-01",
+            "event_place": "场馆",
+            "event_description": "芙宁娜",
+            "confidence": 0.95,
+            "status": "已取销" # 非法状态拼写，强制校验失败
+        }
+    ]
+    
+    with patch("src.agents.event_agent.analyze_post_with_retry", return_value=invalid_events) as mock_analyze:
+        from src.services.workflow_orchestrator import WorkflowOrchestrator
+        total, success, analyzed = await WorkflowOrchestrator.run_analyze(confidence_threshold=0.3)
+        
+        # 验证分析成功回写状态数是 1 (因为熔断也算作扭转状态成功)
+        assert analyzed == 1
+        
+    # 3. 验证主活动数据没有写入脏数据，且 raw_posts.is_analyzed 升级为 2
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM cosplay_events WHERE raw_post_id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 0
+    
+    cursor.execute("SELECT is_analyzed FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 2
+    
+    # 4. 再次执行增量拉取，验证已熔断博文被自动豁免跳过，不再拉取
+    cursor.execute("SELECT COUNT(*) FROM raw_posts WHERE is_analyzed = 0;")
+    unanalyzed_count = cursor.fetchone()[0]
+    
+    pending = DBService.get_unanalyzed_posts()
+    assert len(pending) == unanalyzed_count
+    assert not any(p["id"] == raw_post_id for p in pending)
+    
+    # 清理测试数据
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_analyzer_breaker_transient_failure():
+    """测试暂时性故障（网络抖动等普通异常）不触发熔断，保持 is_analyzed = 0 且编辑更新洗回状态 0"""
+    DBService.add_coser("瞬态测试姬")
+    cosers = DBService.list_cosers()
+    coser_id = [c["id"] for c in cosers if c["name"] == "瞬态测试姬"][0]
+    
+    posts = [{
+        "post_id": "transient_post_222",
+        "content": "漫展行程",
+        "post_url": "url",
+        "edit_count": 0,
+        "published_at": None
+    }]
+    DBService.save_raw_posts(coser_id, "weibo", posts)
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE platform = 'weibo' AND post_id = 'transient_post_222';")
+    raw_post_id = cursor.fetchone()[0]
+    conn.close()
+    
+    # 模拟大模型请求发生 ConnectionError 暂时性异常
+    from unittest.mock import patch
+    with patch("src.agents.event_agent.analyze_post_with_retry", side_effect=ConnectionError("Timeout!")):
+        from src.services.workflow_orchestrator import WorkflowOrchestrator
+        total, success, analyzed = await WorkflowOrchestrator.run_analyze(confidence_threshold=0.3)
+        assert analyzed == 0
+        
+    # 验证 raw_posts.is_analyzed 依旧为 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_analyzed FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 0
+    
+    # 验证爬虫更新可以将熔断状态重置回 0
+    # 先强制模拟其为 2 状态
+    cursor.execute("UPDATE raw_posts SET is_analyzed = 2 WHERE id = ?;", (raw_post_id,))
+    conn.commit()
+    
+    # 触发微博爬虫等原位编辑次数递增更新，验证状态重置为 0
+    updated_posts = [{
+        "post_id": "transient_post_222",
+        "content": "新改版漫展行程",
+        "post_url": "url",
+        "edit_count": 2, # 编辑数递增
+        "published_at": None
+    }]
+    DBService.save_raw_posts(coser_id, "weibo", updated_posts)
+    
+    cursor.execute("SELECT content, edit_count, is_analyzed FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    stored_content, stored_edit, stored_is_analyzed = cursor.fetchone()
+    assert stored_content == "新改版漫展行程"
+    assert stored_edit == 2
+    assert stored_is_analyzed == 0 # 成功洗回 0 状态！
+    
+    # 清理测试数据
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_breaker_permanent_failure_raises_and_marks_2():
+    """测试用例 1：模拟大模型提炼通过，但在入库约束中故意触发 AssertionError，验证主活动表未插入任何脏数据，而 raw_posts.is_analyzed 状态成功置为 2 且下一轮分析不再加载。"""
+    from src.services.db_service import DBService
+    from src.services.workflow_orchestrator import WorkflowOrchestrator
+    from src.models.db_models import get_db_connection
+    from unittest.mock import patch
+
+    # 1. 注册 Coser
+    assert DBService.add_coser("硬错误熔断姬")
+    cosers = DBService.list_cosers()
+    coser_id = [c["id"] for c in cosers if c["name"] == "硬错误熔断姬"][0]
+
+    # 2. 插入 raw post
+    posts = [{
+        "post_id": "breaker_perm_999",
+        "content": "漫展行程",
+        "post_url": "url",
+        "edit_count": 0,
+        "published_at": None
+    }]
+    assert DBService.save_raw_posts(coser_id, "xhs", posts) == 1
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE platform = 'xhs' AND post_id = 'breaker_perm_999';")
+    raw_post_id = cursor.fetchone()[0]
+    conn.close()
+
+    # 3. 模拟大模型提取通过，返回包含非法 status (会触发 AssertionError) 的活动
+    mock_events = [
+        {
+            "event_name": "违法漫展",
+            "event_date": "2026-06-01",
+            "event_place": "场馆",
+            "event_description": "角色",
+            "confidence": 0.9,
+            "source_url": "url",
+            "status": "已取销"  # 非标拼写状态值，触发 validate_status -> AssertionError
+        }
+    ]
+
+    with patch("src.agents.event_agent.analyze_post_with_retry", return_value=mock_events):
+        # 运行分析流程
+        total, success, analyzed = await WorkflowOrchestrator.run_analyze(confidence_threshold=0.3)
+        
+        # 验证分析状态：应该有 1 条博文被处理，0 个活动成功入库，1 条博文被算作已分析（已处理状态扭转）
+        assert total == 1
+        assert success == 0
+        assert analyzed == 1
+
+    # 4. 验证数据库数据完整性：没有新活动插入，并且 is_analyzed 变为了 2
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT count(*) FROM cosplay_events WHERE raw_post_id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 0
+
+    cursor.execute("SELECT is_analyzed FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 2
+    conn.close()
+
+    # 5. 验证下一轮分析不会再次捞出该博文 (由于 is_analyzed = 2)
+    unanalyzed_posts = DBService.get_unanalyzed_posts()
+    assert not any(p["id"] == raw_post_id for p in unanalyzed_posts)
+
+    # 清除测试数据
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_breaker_transient_failure_skips_keeps_0():
+    """测试用例 2：模拟网络超时类异常，验证状态依旧为 0，并且下一轮能够继续捞出重试。"""
+    from src.services.db_service import DBService
+    from src.services.workflow_orchestrator import WorkflowOrchestrator
+    from src.models.db_models import get_db_connection
+    from unittest.mock import patch
+
+    # 1. 注册 Coser
+    assert DBService.add_coser("软错误超时姬")
+    cosers = DBService.list_cosers()
+    coser_id = [c["id"] for c in cosers if c["name"] == "软错误超时姬"][0]
+
+    # 2. 插入 raw post
+    posts = [{
+        "post_id": "breaker_trans_888",
+        "content": "漫展行程",
+        "post_url": "url",
+        "edit_count": 0,
+        "published_at": None
+    }]
+    assert DBService.save_raw_posts(coser_id, "xhs", posts) == 1
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE platform = 'xhs' AND post_id = 'breaker_trans_888';")
+    raw_post_id = cursor.fetchone()[0]
+    conn.close()
+
+    # 3. 模拟分析过程中发生普通网络异常/超时 (Exception)
+    with patch("src.agents.event_agent.analyze_post_with_retry", side_effect=Exception("API Timeout")):
+        # 运行分析流程
+        total, success, analyzed = await WorkflowOrchestrator.run_analyze(confidence_threshold=0.3)
+        
+        # 验证分析状态：1 条待处理，0 个成功入库，0 个已分析完成 (因为是暂时性异常，不改变 is_analyzed 标记)
+        assert total == 1
+        assert success == 0
+        assert analyzed == 0
+
+    # 4. 验证数据库数据完整性：is_analyzed 依然保持 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_analyzed FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 0
+    conn.close()
+
+    # 5. 验证下一轮仍能正常捞出待分析
+    unanalyzed_posts = DBService.get_unanalyzed_posts()
+    assert any(p["id"] == raw_post_id for p in unanalyzed_posts)
+
+    # 清除测试数据
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_breaker_edit_count_reset_from_2_to_0():
+    """测试用例 3：模拟将已熔断（状态为 2）的博文进行爬虫更新，验证其 is_analyzed 状态被成功洗回 0。"""
+    from src.services.db_service import DBService
+    from src.models.db_models import get_db_connection
+
+    # 1. 注册 Coser
+    assert DBService.add_coser("状态重置姬")
+    cosers = DBService.list_cosers()
+    coser_id = [c["id"] for c in cosers if c["name"] == "状态重置姬"][0]
+
+    # 2. 插入 raw post
+    posts = [{
+        "post_id": "breaker_reset_777",
+        "content": "漫展行程 第一次内容",
+        "post_url": "url",
+        "edit_count": 0,
+        "published_at": None
+    }]
+    assert DBService.save_raw_posts(coser_id, "weibo", posts) == 1
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE platform = 'weibo' AND post_id = 'breaker_reset_777';")
+    raw_post_id = cursor.fetchone()[0]
+    
+    # 3. 强行将该博文标记为 2 (熔断挂起)
+    cursor.execute("UPDATE raw_posts SET is_analyzed = 2 WHERE id = ?;", (raw_post_id,))
+    conn.commit()
+    
+    # 验证此时状态确为 2
+    cursor.execute("SELECT is_analyzed FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 2
+    conn.close()
+
+    # 4. 模拟爬虫抓取到编辑更新后的新版本 (edit_count 递增，无后缀)
+    updated_posts = [{
+        "post_id": "breaker_reset_777",
+        "content": "漫展行程 修正后的合法内容",
+        "post_url": "url",
+        "edit_count": 1,
+        "published_at": None
+    }]
+    
+    # 运行 save_raw_posts，应当触发 in-place 原位更新，同时将 is_analyzed 刷回 0
+    assert DBService.save_raw_posts(coser_id, "weibo", updated_posts) == 1
+
+    # 5. 验证状态被重置为 0，并且内容和 edit_count 更新成功
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_analyzed, content, edit_count FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    is_analyzed, content, edit_count = cursor.fetchone()
+    assert is_analyzed == 0
+    assert content == "漫展行程 修正后的合法内容"
+    assert edit_count == 1
+    conn.close()
+
+    # 清除测试数据
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_coser_multi_platform_dedup_and_merge():
+    """验证 Coser 在多平台/多次发布未来同一日程时，原位 In-place 合并去重且拼接描述、升级链接和置信度"""
+    # 1. 注册测试 Coser 和博文
+    DBService.add_coser("多平台去重测试Coser")
+    cosers = DBService.list_cosers()
+    coser_id = cosers[0]["id"]
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content) VALUES (?, 'weibo', 'p_weibo_dedup', 'weibo content');", (coser_id,))
+    raw_post_id_1 = cursor.lastrowid
+    cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content) VALUES (?, 'bilibili', 'p_bili_dedup', 'bili content');", (coser_id,))
+    raw_post_id_2 = cursor.lastrowid
+    conn.commit()
+    
+    # 2. 第一次录入微博日程 (CP30，第一天出黄泉)
+    events_weibo = [{
+        "event_name": "Comicup 30",
+        "event_date": "2029-05-02",
+        "event_place": "上海新国际",
+        "event_description": "第一天出黄泉",
+        "confidence": 0.88,
+        "source_url": "url_weibo",
+        "event_type": "漫展"
+    }]
+    assert DBService.save_extracted_events_transactional(raw_post_id_1, events_weibo, 0.0) is True
+    
+    # 验证此时日程有 1 行
+    cursor.execute("SELECT id, raw_post_id, event_description, source_url, confidence FROM cosplay_events WHERE coser_name = '多平台去重测试Coser';")
+    rows = cursor.fetchall()
+    assert len(rows) == 1
+    db_id = rows[0][0]
+    assert rows[0][1] == raw_post_id_1
+    assert rows[0][2] == "第一天出黄泉"
+    assert rows[0][3] == "url_weibo"
+    assert abs(rows[0][4] - 0.88) < 0.01
+    
+    # 3. 第二次录入B站日程 (CP30，A15摊位签售)，预期触发 In-place 合并去重
+    events_bili = [{
+        "event_name": "Comicup 30",
+        "event_date": "2029-05-02",
+        "event_place": "上海新国际",
+        "event_description": "A15摊位签售",
+        "confidence": 0.96,
+        "source_url": "url_bili",
+        "event_type": "漫展"
+    }]
+    assert DBService.save_extracted_events_transactional(raw_post_id_2, events_bili, 0.0) is True
+    
+    # 再次查询该 Coser 的所有日程，行数预期依然是 1
+    cursor.execute("SELECT id, raw_post_id, event_description, source_url, confidence FROM cosplay_events WHERE coser_name = '多平台去重测试Coser';")
+    rows = cursor.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == db_id  # 物理 ID 不变，原位更新
+    assert rows[0][1] == raw_post_id_2  # 升级为最新博文 ID
+    assert rows[0][2] == "第一天出黄泉 | A15摊位签售"  # 描述智能拼接合并
+    assert rows[0][3] == "url_bili"  # source_url 升级为最新
+    assert abs(rows[0][4] - 0.96) < 0.01  # 置信度升级为最新
+    
+    # 清除测试数据
+    cursor.execute("DELETE FROM cosplay_events WHERE coser_name = '多平台去重测试Coser';")
+    cursor.execute("DELETE FROM raw_posts WHERE id IN (?, ?);", (raw_post_id_1, raw_post_id_2))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_abbreviation_alignment_and_low_ratio_referee():
+    """验证缩写预对齐词典直接合并以及放宽后的 [0.2, 0.75) 低比率时空重叠触发裁判"""
+    from src.services.fusion_service import EventFusionService
+    from unittest.mock import patch, AsyncMock
+    
+    DBService.add_coser("融合测试Coser二代")
+    cosers = DBService.list_cosers()
+    coser_id = cosers[0]["id"]
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content) VALUES (?, 'weibo', 'p_abbrev', 'content');", (coser_id,))
+    raw_post_id = cursor.lastrowid
+    conn.commit()
+    
+    # A. 简称直接对齐测试：上海bw2026 应与 bilibiliworld2026 直接一致
+    event_id_1 = EventFusionService.find_or_create_normalized_event(cursor, "bilibiliworld2026", "上海", "2026-05-02")
+    event_id_2 = EventFusionService.find_or_create_normalized_event(cursor, "上海bw2026", "上海", "2026-05-02")
+    # 由于 "bw" 自动在极简清洗中替换为 "bilibiliworld" 且剔除字符，"shanghaibilibiliworld2026" 相似比对极高直接命中
+    assert event_id_1 == event_id_2
+    
+    # B. 放宽 ratio 下限至 0.2 并触发 LLM 裁判测试
+    # "bilibiliworld2026" vs "上海BiliWorld26"。清洗后 "shanghaibilibiliworld26" 长度23，"bilibiliworld2026" 长度18
+    # difflib.SequenceMatcher.ratio 约为 0.65，在 [0.2, 0.75) 区间内，且同城同档期 (2026-05-02 与 2026-05-03 在 3 天重叠窗口内)
+    # 预期必须拉起 LLM 裁判判定
+    with patch("src.services.fusion_service.EventFusionService.run_fusion_judge_agent", new_callable=AsyncMock) as mock_judge:
+        mock_judge.return_value = True
+        
+        event_id_3 = EventFusionService.find_or_create_normalized_event(cursor, "上海BiliWorld26", "上海", "2026-05-03")
+        assert event_id_3 == event_id_1
+        mock_judge.assert_called_once()
+        
+    # 清理数据
+    cursor.execute("DELETE FROM normalized_events WHERE city = '上海';")
+    cursor.execute("DELETE FROM event_aliases WHERE city = '上海';")
+    cursor.execute("DELETE FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    cursor.execute("DELETE FROM cosers WHERE id = ?;", (coser_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_date_inference_inheritance_view_and_export(tmp_path):
+    """验证未知日程动态继承超级漫展日期，并在查询服务、控制台格式化、文件导出时稳定展现"""
+    from src.views.terminal_renderer import TerminalRenderer
+    from src.services.export_service import ExportService
+    DBService.add_coser("CoserA_Known")
+    DBService.add_coser("CoserB_Unknown")
+    cosers = DBService.list_cosers()
+    coser_a_id = [c for c in cosers if c["name"] == "CoserA_Known"][0]["id"]
+    coser_b_id = [c for c in cosers if c["name"] == "CoserB_Unknown"][0]["id"]
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content) VALUES (?, 'weibo', 'post_a', 'content');", (coser_a_id,))
+    raw_post_a = cursor.lastrowid
+    cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content) VALUES (?, 'weibo', 'post_b', 'content');", (coser_b_id,))
+    raw_post_b = cursor.lastrowid
+    conn.commit()
+    
+    # 1. 录入 A 具有明确举办日期的日程 (超级节点 CP30 被标定为 2029-05-02 至 2029-05-02)
+    events_a = [{
+        "event_name": "Comicup 30",
+        "event_date": "2029-05-02",
+        "event_place": "上海国家会展",
+        "event_description": "第一天",
+        "confidence": 0.9,
+        "event_type": "漫展"
+    }]
+    assert DBService.save_extracted_events_transactional(raw_post_a, events_a, 0.0) is True
+    
+    # 2. 录入 B 具有未知日期日程
+    events_b = [{
+        "event_name": "Comicup 30",
+        "event_date": "未知",
+        "event_place": "上海国家会展",
+        "event_description": "出角色",
+        "confidence": 0.9,
+        "event_type": "漫展"
+    }]
+    assert DBService.save_extracted_events_transactional(raw_post_b, events_b, 0.0) is True
+    
+    # 3. 验证 QueryService 看板查询继承
+    all_events = DBService.get_all_events(0.0, scope="all")
+    coser_b_event = [e for e in all_events if e["coser_name"] == "CoserB_Unknown"][0]
+    # 日期应该自动继承并带上 (推算自超级节点) 标签
+    assert coser_b_event["event_date"] == "2029-05-02 至 2029-05-02 (推算自超级节点)"
+    
+    # 4. 验证 TerminalRenderer._style_date 带有等宽彩显
+    styled = TerminalRenderer._style_date(coser_b_event["event_date"])
+    assert "\x1b" in styled  # 检查是否包含 ANSI Escape Codes 的彩显标记
+    assert "2029-05-02 至 2029-05-02" in styled
+    assert "(推算自超级节点)" in styled
+    
+    # 5. 验证 ExportService 导出继承
+    out_txt = tmp_path / "export.txt"
+    ExportService.export_events(str(out_txt), 0.0, "all", "txt")
+    with open(out_txt, "r", encoding="utf-8") as f:
+        txt_content = f.read()
+    assert "2029-05-02 至 2029-05-02 (推算自超级节点)" in txt_content
+    
+    # 清理数据
+    cursor.execute("DELETE FROM cosplay_events WHERE coser_name IN ('CoserA_Known', 'CoserB_Unknown');")
+    cursor.execute("DELETE FROM normalized_events WHERE city = '上海';")
+    cursor.execute("DELETE FROM raw_posts WHERE id IN (?, ?);", (raw_post_a, raw_post_b))
+    cursor.execute("DELETE FROM cosers WHERE id IN (?, ?);", (coser_a_id, coser_b_id))
+    conn.commit()
+    conn.close()
+
 
 

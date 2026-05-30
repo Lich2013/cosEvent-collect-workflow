@@ -67,7 +67,9 @@ def test_database_niche_validation_and_check():
     conn.commit()
     conn.close()
     
-    assert DBService.save_extracted_events_transactional(raw_post_id, events, confidence_threshold=0.0) is False
+    # 应该抛出 AssertionError 激活熔断机制
+    with pytest.raises(AssertionError):
+        DBService.save_extracted_events_transactional(raw_post_id, events, confidence_threshold=0.0)
 
 def test_fusion_bypass_for_niche_events():
     """测试非 '漫展' 的小众活动 100% 旁路融合与裁判引擎"""

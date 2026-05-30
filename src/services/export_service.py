@@ -145,7 +145,7 @@ class ExportService:
             writer.writerow(headers)
             for e in events:
                 date_str = e['start_date']
-                if e['start_date'] != e['end_date'] and e['end_date'] != '未知':
+                if e['start_date'] != '未知' and e['end_date'] != '未知':
                     date_str = f"{e['start_date']} 至 {e['end_date']}"
                 writer.writerow([
                     date_str,
@@ -163,7 +163,7 @@ class ExportService:
                 writer.writerow(headers)
                 for e in events:
                     date_str = e['start_date']
-                    if e['start_date'] != e['end_date'] and e['end_date'] != '未知':
+                    if e['start_date'] != '未知' and e['end_date'] != '未知':
                         date_str = f"{e['start_date']} 至 {e['end_date']}"
                     writer.writerow([
                         date_str,
@@ -189,7 +189,7 @@ class ExportService:
         
         for e in events:
             date_str = e['start_date']
-            if e['start_date'] != e['end_date'] and e['end_date'] != '未知':
+            if e['start_date'] != '未知' and e['end_date'] != '未知':
                 date_str = f"{e['start_date']} 至 {e['end_date']}"
             lines.append(f"| {date_str} | {e['city']} | **{e['standard_name']}** | {e['coser_count']}位 | {e['core_info']} |")
             

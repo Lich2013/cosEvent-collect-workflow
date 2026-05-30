@@ -52,6 +52,35 @@ class CoserRepository:
             conn.close()
 
     @staticmethod
+    def get_active_cosers_without_bilibili() -> list[dict]:
+        """获取所有未绑定 B站 UID 且处于激活状态的 Coser 列表"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT id, name, weibo_uid, bilibili_uid, xhs_uid, is_active, created_at 
+                FROM cosers
+                WHERE is_active = 1 AND (bilibili_uid IS NULL OR bilibili_uid = '' OR bilibili_uid = '-');
+                """
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "weibo_uid": r[2],
+                    "bilibili_uid": r[3],
+                    "xhs_uid": r[4],
+                    "is_active": r[5],
+                    "created_at": r[6]
+                } for r in rows
+            ]
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
     def update_coser(name: str, weibo_uid: str = None, bilibili_uid: str = None, xhs_uid: str = None, is_active: int = None) -> bool:
         """更新 Coser 属性或启用状态"""
         conn = get_db_connection()
@@ -124,10 +153,10 @@ class CoserRepository:
 
                 base_post_id = post_id.split("#")[0]
 
-                # 1. 查找该博文的最新已存版本以获取内容和版本信息
+                # 1. 查找该博文的最新已存版本以获取内容、版本信息及发布/编辑时间
                 cursor.execute(
                     """
-                    SELECT id, post_id, edit_count, content FROM raw_posts
+                    SELECT id, post_id, edit_count, content, published_at FROM raw_posts
                     WHERE platform = ? AND (post_id = ? OR post_id LIKE ?)
                     ORDER BY edit_count DESC LIMIT 1;
                     """,
@@ -136,11 +165,46 @@ class CoserRepository:
                 row = cursor.fetchone()
 
                 if row:
-                    stored_id, stored_post_id, stored_edit_count, stored_content = row
+                    stored_id, stored_post_id, stored_edit_count, stored_content, stored_published_at = row
                     stored_edit_count = int(stored_edit_count or 0)
 
-                    # B站/小红书自适应内容变动合成版本控制
-                    if platform in ("bilibili", "xhs"):
+                    # B站 gRPC 模式下的物理版本控制
+                    if platform == "bilibili" and post.get("is_grpc"):
+                        if post.get("is_edited", False):
+                            # 如果是编辑过的版本，且物理编辑时间不同，则递增版本号插入新版
+                            if published_at != stored_published_at:
+                                edit_count = stored_edit_count + 1
+                                versioned_post_id = f"{base_post_id}#v{edit_count}"
+                                cursor.execute(
+                                    """
+                                    INSERT INTO raw_posts (coser_id, platform, post_id, content, post_url, edit_count, published_at, is_analyzed, scraped_at)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?);
+                                    """,
+                                    (coser_id, platform, versioned_post_id, content, post_url, edit_count, published_at, now_str)
+                                )
+                                inserted_count += 1
+                        # 若未编辑但内容发生了更新（处理 B站不报 is_edited 且不改时间戳的幽灵置顶编辑行为）
+                        elif not post.get("is_edited", False) and content != stored_content:
+                            # 既然内容变了，说明一定是编辑过。生成全新虚拟版本行，重锚当前抓取时间作为发布时间，以便 AI Agent 准确定位年份
+                            edit_count = stored_edit_count + 1
+                            versioned_post_id = f"{base_post_id}#v{edit_count}"
+                            cursor.execute(
+                                """
+                                INSERT INTO raw_posts (coser_id, platform, post_id, content, post_url, edit_count, published_at, is_analyzed, scraped_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?);
+                                """,
+                                (coser_id, platform, versioned_post_id, content, post_url, edit_count, now_str, now_str)
+                            )
+                            inserted_count += 1
+                        # 若未编辑且内容相同，但 gRPC 拿到了更精确的 published_at，原位修正时间戳（不新增版本，不重置分析状态）
+                        elif not post.get("is_edited", False) and published_at and published_at != stored_published_at:
+                            cursor.execute(
+                                "UPDATE raw_posts SET published_at = ?, scraped_at = ? WHERE id = ?;",
+                                (published_at, now_str, stored_id)
+                            )
+                        # 若未编辑且物理编辑时间、内容完全相同，则作为重复记录直接过滤去重
+                    # B站 Playwright 模式与小红书的自适应内容变动合成版本控制
+                    elif platform == "xhs" or (platform == "bilibili" and not post.get("is_grpc")):
                         if content != stored_content:
                             # 内容发生变化，虚拟递增版本号
                             edit_count = stored_edit_count + 1

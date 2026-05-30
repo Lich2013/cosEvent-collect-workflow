@@ -42,6 +42,7 @@ env/
 
 # Project Specific Database & Runtime Directory
 runtime/
+cosevent.db
 
 # Sensitive Cookies & Session States
 config/cookies/*.json
@@ -53,3 +54,4 @@ config/cookies/*.json
 .pytest_cache/
 .coverage
 htmlcov/
+scratch/

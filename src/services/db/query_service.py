@@ -10,39 +10,52 @@ class QueryService:
         cursor = conn.cursor()
         try:
             sql = """
-            SELECT id, raw_post_id, coser_name, event_name, event_date, event_place, event_description, confidence, source_url, created_at
-            FROM cosplay_events
-            WHERE confidence >= ? AND status != '已取消'
+            SELECT 
+                ce.id, ce.raw_post_id, ce.coser_name, ce.event_name, ce.event_date, ce.event_place, ce.event_description, ce.confidence, ce.source_url, ce.created_at,
+                ne.start_date, ne.end_date
+            FROM cosplay_events ce
+            LEFT JOIN normalized_events ne ON ce.normalized_event_id = ne.id
+            WHERE ce.confidence >= ? AND ce.status != '已取消'
             """
             params = [confidence_threshold]
             
             if event_type:
-                sql += " AND event_type = ?"
+                sql += " AND ce.event_type = ?"
                 params.append(event_type)
             
             if scope == "future":
                 beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
                 current_date = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d")
-                sql += " AND (event_date >= ? OR event_date = '未知')"
+                sql += " AND (ce.event_date >= ? OR ce.event_date = '未知')"
                 params.append(current_date)
                 
-            sql += " ORDER BY event_date ASC;"
+            sql += " ORDER BY ce.event_date ASC;"
             cursor.execute(sql, tuple(params))
             rows = cursor.fetchall()
-            return [
-                {
+            
+            result = []
+            for r in rows:
+                event_date = r[4]
+                ne_start = r[10]
+                ne_end = r[11]
+                
+                # 如果单体日程日期为 '未知'，但关联的超级节点日期有效，则进行继承推算
+                if event_date == '未知' and ne_start and ne_end:
+                    event_date = f"{ne_start} 至 {ne_end} (推算自超级节点)"
+                    
+                result.append({
                     "id": r[0],
                     "raw_post_id": r[1],
                     "coser_name": r[2],
                     "event_name": r[3],
-                    "event_date": r[4],
+                    "event_date": event_date,
                     "event_place": r[5],
                     "event_description": r[6],
                     "confidence": r[7],
                     "source_url": r[8],
                     "created_at": r[9]
-                } for r in rows
-            ]
+                })
+            return result
         finally:
             cursor.close()
             conn.close()
@@ -82,18 +95,26 @@ class QueryService:
             events_map = {}
             for r in rows:
                 ev_id = r[0]
+                ne_start = r[3]
+                ne_end = r[4]
+                coser_date = r[6]
+                
+                # 如果单体日程日期为 '未知'，但关联的超级节点日期有效，则进行继承推算
+                if coser_date == '未知' and ne_start and ne_end:
+                    coser_date = f"{ne_start} 至 {ne_end} (推算自超级节点)"
+                
                 if ev_id not in events_map:
                     events_map[ev_id] = {
                         "id": ev_id,
                         "standard_name": r[1],
                         "city": r[2],
-                        "start_date": r[3] or "未知",
-                        "end_date": r[4] or "未知",
+                        "start_date": ne_start or "未知",
+                        "end_date": ne_end or "未知",
                         "cosers": []
                     }
                 events_map[ev_id]["cosers"].append({
                     "coser_name": r[5],
-                    "event_date": r[6],
+                    "event_date": coser_date,
                     "event_place": r[7],
                     "event_description": r[8],
                     "confidence": r[9]

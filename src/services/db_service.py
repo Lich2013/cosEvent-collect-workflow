@@ -22,6 +22,10 @@ class DBService:
         return CoserRepository.list_cosers(only_active)
 
     @staticmethod
+    def get_active_cosers_without_bilibili() -> list[dict]:
+        return CoserRepository.get_active_cosers_without_bilibili()
+
+    @staticmethod
     def update_coser(name: str, weibo_uid: str = None, bilibili_uid: str = None, xhs_uid: str = None, is_active: int = None) -> bool:
         return CoserRepository.update_coser(name, weibo_uid, bilibili_uid, xhs_uid, is_active)
 
@@ -46,6 +50,10 @@ class DBService:
     @staticmethod
     def save_extracted_events_transactional(raw_post_id: int, events: list[dict], confidence_threshold: float) -> bool:
         return EventRepository.save_extracted_events_transactional(raw_post_id, events, confidence_threshold)
+
+    @staticmethod
+    def mark_post_analysis_failed(raw_post_id: int) -> bool:
+        return EventRepository.mark_post_analysis_failed(raw_post_id)
 
     # ==============================================================================
     # 4. 只读聚合看板及时间轴日历查询委托 (读写分离 CQRS)

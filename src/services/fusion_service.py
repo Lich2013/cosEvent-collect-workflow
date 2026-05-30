@@ -94,6 +94,7 @@ class EventFusionService:
         if not name:
             return ""
         s = name.lower().strip()
+        s = s.replace("bw", "bilibiliworld").replace("cp", "comicup")
         s = re.sub(r"[\s\-\_\,\.\!\?\#\&\*\/]", "", s)
         return s
 
@@ -191,8 +192,8 @@ class EventFusionService:
                 matched_node_id = node_id
                 break
                 
-            # 分支 2：0.5 <= R < 0.75 进入存疑区
-            elif 0.5 <= ratio < 0.75:
+            # 分支 2：0.2 <= R < 0.75 进入存疑区
+            elif 0.2 <= ratio < 0.75:
                 # 检查别名缓存表 (统一使用清洗后的纯净别名 Slug)
                 cleaned_alias = EventFusionService._clean_name(event_name_cleaned)
                 cursor.execute(

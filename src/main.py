@@ -82,13 +82,116 @@ def delete_coser(name):
     else:
         click.secho(f"✗ 删除 Coser [{name}] 失败，未找到该记录。", fg="red", bold=True)
 
+@coser.command("sync-bili")
+@click.option("--limit", default=10, type=int, help="本次同步最大爬行/更新名额限制，默认 10")
+@click.option("--dry-run", is_flag=True, help="仅进行检索和评分比对，不实际修改数据库")
+def sync_bili_command(limit, dry_run):
+    """[Sync Bili UID] 智能自动检索并启发式绑定活跃 Coser 的 B站 UID"""
+    init_db()
+    
+    # 1. 捞取所有活跃且缺失 B站 UID 的 Cosers
+    cosers = DBService.get_active_cosers_without_bilibili()
+    if not cosers:
+        click.secho("当前数据库中没有缺失 B站 UID 的活跃 Coser，无需同步！", fg="green", bold=True)
+        return
+        
+    sync_limit = min(limit, len(cosers))
+    click.secho(f"发现 {len(cosers)} 位活跃 Coser 缺失 B站 UID，本次同步上限设定为: {sync_limit} 位", fg="cyan", bold=True)
+    
+    # 批量提取要搜索的 Coser 名字列表
+    keywords = [coser["name"] for coser in cosers[:sync_limit]]
+    
+    from src.tools.bilibili_scraper import BilibiliScraper
+    from src.services.bili_uid_matcher import BiliUidMatcher
+    
+    scraper = BilibiliScraper()
+    report = []
+    
+    try:
+        # 2. 仅启动一次浏览器会话，执行批量拦截检索 (复用 Session，极大减少冷启动)
+        results_map = asyncio.run(scraper.search_bilibili_users_batch(keywords))
+        
+        # 3. 循环处理各个 Coser 的打分匹配与入库
+        for coser in cosers[:sync_limit]:
+            name = coser["name"]
+            old_uid = coser["bilibili_uid"]
+            
+            candidates = results_map.get(name, [])
+            
+            # 启发式打分优选 (已包含 Bio 交叉验证与冷启动免检通道)
+            res = BiliUidMatcher.match_coser(name, candidates)
+            best_match = res["best_match"]
+            score = res["score"]
+            candidates_list = res["candidates"]
+            
+            if best_match:
+                new_uid = best_match["mid"]
+                click.secho(f"✓ [{name}] -> 匹配成功: {best_match['uname']} (UID: {new_uid}) | 得分: {score:.1f}", fg="green")
+                
+                if dry_run:
+                    report.append({
+                        "name": name,
+                        "status": "dry_run",
+                        "old_uid": old_uid,
+                        "new_uid": new_uid,
+                        "score": score,
+                        "candidates_count": len(candidates_list)
+                    })
+                else:
+                    if DBService.update_coser(name, bilibili_uid=new_uid):
+                        report.append({
+                            "name": name,
+                            "status": "success",
+                            "old_uid": old_uid,
+                            "new_uid": new_uid,
+                            "score": score,
+                            "candidates_count": len(candidates_list)
+                        })
+                    else:
+                        report.append({
+                            "name": name,
+                            "status": "error",
+                            "old_uid": old_uid,
+                            "new_uid": None,
+                            "score": 0.0,
+                            "candidates_count": len(candidates_list)
+                        })
+            else:
+                click.secho(f"✗ [{name}] -> 未检索到满足置信度门槛的匹配者。", fg="yellow")
+                report.append({
+                    "name": name,
+                    "status": "no_match",
+                    "old_uid": old_uid,
+                    "new_uid": None,
+                    "score": 0.0,
+                    "candidates_count": len(candidates_list)
+                })
+    except Exception as e:
+        click.secho(f"✗ 同步批处理发生异常: {e}", fg="red")
+        for name in keywords:
+            report.append({
+                "name": name,
+                "status": "error",
+                "old_uid": "-",
+                "new_uid": None,
+                "score": 0.0,
+                "candidates_count": 0
+            })
+            
+    # 4. 渲染精美的表格同步报告
+    TerminalRenderer.render_sync_bili_report(report)
+
 @cli.command("scrape")
 @click.option("--limit", default=None, type=int, help="单一平台单次最大爬取条数 (覆盖默认配置)")
-def scrape_command(limit):
+@click.option("--name", default=None, help="仅更新指定姓名/昵称的 Coser 动态")
+@click.option("--platform", type=click.Choice(["weibo", "bilibili", "xhs", "all"]), default="all", help="仅更新指定平台的数据（默认 all）")
+def scrape_command(limit, name, platform):
     """[Scrape Phase] 异步去重抓取活跃 Coser 博文动态"""
     init_db()
     lim = limit or settings.default_limit
-    total_cosers, success_platforms, total_inserted = asyncio.run(WorkflowOrchestrator.run_scrape(lim))
+    total_cosers, success_platforms, total_inserted = asyncio.run(
+        WorkflowOrchestrator.run_scrape(lim, coser_name=name, platform=platform)
+    )
     click.echo("\n" + "=" * 40)
     click.secho("[Scraper 爬取单步完成]", fg="yellow", bold=True)
     click.echo(f"- 活跃 Coser 数量: {total_cosers} 人")
