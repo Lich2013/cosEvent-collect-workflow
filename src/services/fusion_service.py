@@ -144,6 +144,145 @@ class EventFusionService:
             print(f"\x1b[1;32m[Fusion Engine Bypass] 成功旁路融合并为小众活动类型 '{event_type}' 创建超级节点 (ID: {new_id}): '{event_name_cleaned}' (📍 {city_cleaned})\x1b[0m")
             return new_id
         
+        # ======================================================================
+        # 【入口 O(1) 字典匹配与时间窗口秒配、时空纠偏级联处理】
+        # ======================================================================
+        name_slug = EventFusionService._clean_name(event_name_cleaned)
+        
+        # 1. 搜集候选节点 (本城 和 未知)
+        fps = [f"{city_cleaned.lower()}_{name_slug}"]
+        if city_cleaned != "未知":
+            fps.append(f"未知_{name_slug}")
+            
+        placeholders = ",".join(["?"] * len(fps))
+        cursor.execute(
+            f"""
+            SELECT id, event_fingerprint, standard_name, city, start_date, end_date
+            FROM normalized_events
+            WHERE event_type = '漫展' AND (event_fingerprint IN ({placeholders}) OR (city IN (?, '未知') AND standard_name = ?));
+            """,
+            (*fps, city_cleaned, event_name_cleaned)
+        )
+        candidates = cursor.fetchall()
+        
+        # 2. 搜集别名表候选节点 (本城 和 未知)
+        alias_cities = [city_cleaned]
+        if city_cleaned != "未知":
+            alias_cities.append("未知")
+        alias_placeholders = ",".join(["?"] * len(alias_cities))
+        cursor.execute(
+            f"""
+            SELECT ne.id, ne.event_fingerprint, ne.standard_name, ne.city, ne.start_date, ne.end_date
+            FROM event_aliases ea
+            JOIN normalized_events ne ON ea.normalized_event_id = ne.id
+            WHERE ea.alias_name = ? AND ea.city IN ({alias_placeholders}) AND ne.event_type = '漫展';
+            """,
+            (name_slug, *alias_cities)
+        )
+        alias_candidates = cursor.fetchall()
+        
+        # 合并去重
+        candidate_map = {}
+        for row in candidates + alias_candidates:
+            candidate_map[row[0]] = row
+            
+        # 3. 7天时间窗口校验
+        current_dt = None
+        if event_date and re.match(r"^\d{4}-\d{2}-\d{2}$", event_date):
+            try:
+                current_dt = datetime.datetime.strptime(event_date, "%Y-%m-%d").date()
+            except Exception:
+                current_dt = None
+                
+        concrete_nodes = []
+        unknown_nodes = []
+        
+        for c_id, fp, std_name, c_city, s_date, e_date in candidate_map.values():
+            time_overlap = False
+            if current_dt is None:
+                # 待匹配日程时间为“未知”，只允许合并至同为“未知”时间的超级节点，或当前/未来年份的超级节点，防止坍塌到历史往届年份中
+                if not s_date or s_date == "未知":
+                    time_overlap = True
+                else:
+                    try:
+                        node_year = int(s_date.split("-")[0])
+                        current_year = datetime.datetime.now().year
+                        if node_year >= current_year:
+                            time_overlap = True
+                    except Exception:
+                        time_overlap = True
+            else:
+                # 待匹配日程具有具体时间，允许匹配“未知”时间节点，或与相差7天之内的具体节点秒配
+                if not s_date or s_date == "未知" or not e_date or e_date == "未知":
+                    time_overlap = True
+                else:
+                    try:
+                        node_start = datetime.datetime.strptime(s_date, "%Y-%m-%d").date()
+                        node_end = datetime.datetime.strptime(e_date, "%Y-%m-%d").date()
+                        if (node_start - datetime.timedelta(days=7)) <= current_dt <= (node_end + datetime.timedelta(days=7)):
+                            time_overlap = True
+                    except Exception:
+                        time_overlap = True
+            
+            if time_overlap:
+                if c_city == city_cleaned:
+                    concrete_nodes.append((c_id, fp, std_name, c_city, s_date, e_date))
+                elif c_city == "未知":
+                    unknown_nodes.append((c_id, fp, std_name, c_city, s_date, e_date))
+                    
+        # 4. 纠偏决策流
+        if city_cleaned == "未知":
+            if unknown_nodes:
+                print(f"\x1b[1;32m[Fusion Engine O(1)] 快速匹配成功 (未知城市): '{event_name_cleaned}' ──▶ '{unknown_nodes[0][2]}' (ID: {unknown_nodes[0][0]})\x1b[0m")
+                return unknown_nodes[0][0]
+        else:
+            if concrete_nodes:
+                concrete_id = concrete_nodes[0][0]
+                print(f"\x1b[1;32m[Fusion Engine O(1)] 快速匹配成功 (本城): '{event_name_cleaned}' ──▶ '{concrete_nodes[0][2]}' (ID: {concrete_id})\x1b[0m")
+                
+                # Task 3.3: 既存本城具体节点，级联重定向并清理无引用的“未知”城市节点
+                if unknown_nodes:
+                    import sqlite3 as sqlite_err
+                    for unk_node in unknown_nodes:
+                        unk_id = unk_node[0]
+                        cursor.execute("UPDATE cosplay_events SET normalized_event_id = ? WHERE normalized_event_id = ?;", (concrete_id, unk_id))
+                        try:
+                            cursor.execute("DELETE FROM normalized_events WHERE id = ?;", (unk_id,))
+                        except sqlite_err.IntegrityError as e:
+                            print(f"\x1b[1;33m[Spatial Rectification Warning] 级联删除未知节点 ID {unk_id} 时触发外键约束冲突，已自动跳过删除以确保数据库完整性: {e}\x1b[0m")
+                        print(f"\x1b[1;33m[Spatial Rectification] 检测到既存具体城市节点 (ID: {concrete_id})，级联重定向未知节点 (ID: {unk_id}) 的日程并物理合并该悬挂未知节点。\x1b[0m")
+                
+                return concrete_id
+                
+            elif unknown_nodes:
+                # Task 3.2: 本城节点不存在，就地物理升级“未知”节点
+                unk_id = unknown_nodes[0][0]
+                target_fingerprint = f"{city_cleaned.lower()}_{name_slug}"
+                
+                cursor.execute(
+                    "UPDATE normalized_events SET city = ?, event_fingerprint = ? WHERE id = ?;",
+                    (city_cleaned, target_fingerprint, unk_id)
+                )
+                
+                # 级联更新别名表城市，避免 UNIQUE(alias_name, city) 冲突，并在合并重复别名时输出可观测审计日志
+                cursor.execute("SELECT id, alias_name, normalized_event_id FROM event_aliases WHERE normalized_event_id = ?;", (unk_id,))
+                alias_rows = cursor.fetchall()
+                for alias_db_id, alias_name, _ in alias_rows:
+                    cursor.execute(
+                        "SELECT id, normalized_event_id FROM event_aliases WHERE alias_name = ? AND city = ? AND id != ?;",
+                        (alias_name, city_cleaned, alias_db_id)
+                    )
+                    existing_alias = cursor.fetchone()
+                    if existing_alias:
+                        target_node_id = existing_alias[1]
+                        print(f"\x1b[1;33m[Spatial Rectification Audit] 别名 '{alias_name}' 在城市 '{city_cleaned}' 中已存在，指向超级节点 ID {target_node_id}。正在合并清理未知节点的重复别名行 (ID: {alias_db_id})。\x1b[0m")
+                        cursor.execute("DELETE FROM event_aliases WHERE id = ?;", (alias_db_id,))
+                    else:
+                        cursor.execute("UPDATE event_aliases SET city = ? WHERE id = ?;", (city_cleaned, alias_db_id))
+                        
+                print(f"\x1b[1;32m[Spatial Rectification] 成功将“未知”城市节点 (ID: {unk_id}) 就地物理升级为具体城市 '{city_cleaned}'，更新指纹为 '{target_fingerprint}'。\x1b[0m")
+                return unk_id
+
         # 2. 查询同城的所有既存归一化节点
         cursor.execute(
             """
@@ -168,16 +307,30 @@ class EventFusionService:
         for node_id, fingerprint, standard_name, node_city, start_date, end_date in existing_nodes:
             # A. 时间窗口过滤
             time_overlap = False
-            if not current_dt or not start_date or not end_date:
-                time_overlap = True
-            else:
-                try:
-                    node_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
-                    node_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
-                    if (node_start - datetime.timedelta(days=3)) <= current_dt <= (node_end + datetime.timedelta(days=3)):
-                        time_overlap = True
-                except Exception:
+            if current_dt is None:
+                # 待匹配日程时间为“未知”，只允许合并至同为“未知”时间的既存节点，或当前/未来年份的超级节点，防止坍塌到历史往届年份中
+                if not start_date or start_date == "未知":
                     time_overlap = True
+                else:
+                    try:
+                        node_year = int(start_date.split("-")[0])
+                        current_year = datetime.datetime.now().year
+                        if node_year >= current_year:
+                            time_overlap = True
+                    except Exception:
+                        time_overlap = True
+            else:
+                # 待匹配日程有具体时间，可匹配未知时间节点或在3天时间窗口内的具体节点
+                if not start_date or start_date == "未知" or not end_date or end_date == "未知":
+                    time_overlap = True
+                else:
+                    try:
+                        node_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
+                        node_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+                        if (node_start - datetime.timedelta(days=3)) <= current_dt <= (node_end + datetime.timedelta(days=3)):
+                            time_overlap = True
+                    except Exception:
+                        time_overlap = True
                     
             if not time_overlap:
                 continue

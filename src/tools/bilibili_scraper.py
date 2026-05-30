@@ -12,9 +12,8 @@ import asyncio
 from src.tools.playwright_base import BaseScraper
 from src.config import settings
 
-# 动态载入已编译的 gRPC protobuf 相关模块
-# TODO: (Refactor) 将编译生成的 gRPC protobuf 存根从临时目录 `scratch/grpc_gen` 迁移至规范的运行时包 `src/generated/` 中。
-generated_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../scratch/grpc_gen"))
+# 动态载入已编译的 gRPC protobuf 相关模块 (已从 scratch/grpc_gen 物理迁移至 src/generated 规范包)
+generated_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../generated"))
 if generated_path not in sys.path:
     sys.path.insert(0, generated_path)
 

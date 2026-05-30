@@ -23,6 +23,9 @@ class Settings:
         self.bilibili_grpc_access_token = ""
         self.bilibili_grpc_mid = 0
         
+        # 动态自适应地级市列表
+        self.custom_cities = []
+        
         # 默认多供应商及流水线配置
         self.llm_providers = {
             "openai": {
@@ -54,6 +57,8 @@ class Settings:
                         self.langfuse_host = data.get("langfuse_host", self.langfuse_host)
                         self.llm_providers = data.get("llm_providers", self.llm_providers)
                         self.analysis_pipeline = data.get("analysis_pipeline", self.analysis_pipeline)
+                        
+                        self.custom_cities = data.get("custom_cities", [])
                         
                         bili_grpc = data.get("bilibili_grpc", {}) or {}
                         self.bilibili_grpc_access_token = bili_grpc.get("access_token", "")

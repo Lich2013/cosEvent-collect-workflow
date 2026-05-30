@@ -55,4 +55,13 @@ bilibili_grpc:
   access_token: "${BILIBILI_ACCESS_TOKEN}"
   mid: "${BILIBILI_MID}"
 
+# ==============================================================================
+# Dynamic Prefecture-level Cities Configuration
+# ==============================================================================
+custom_cities:
+  - "常德"
+  - "许昌"
+  - "宜昌"
+
+
 
