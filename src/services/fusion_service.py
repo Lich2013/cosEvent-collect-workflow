@@ -10,6 +10,9 @@ from src.models.schemas import FusionJudgeOutput
 from src.utils.logger import log_event
 from agents import Agent, Runner, RunConfig
 from src.utils.llm_factory import registry_model_provider
+from src.utils.parsers import clean_event_name, MAJOR_CITIES_COMBINED
+
+# 小众极简泛称旁路配置由 settings.bypass_generic_names 动态控制
 
 
 class EventFusionService:
@@ -90,13 +93,8 @@ class EventFusionService:
 
     @staticmethod
     def _clean_name(name: str) -> str:
-        """对漫展名称做极简清洗，以便进行初步计算相似度"""
-        if not name:
-            return ""
-        s = name.lower().strip()
-        s = s.replace("bw", "bilibiliworld").replace("cp", "comicup")
-        s = re.sub(r"[\s\-\_\,\.\!\?\#\&\*\/]", "", s)
-        return s
+        """对漫展名称做极简清洗，以便进行初步计算相似度（代理调用公共 clean_event_name）"""
+        return clean_event_name(name)
 
     @staticmethod
     def find_or_create_normalized_event(cursor, raw_event_name: str, city: str, event_date: str, event_type: str = "漫展") -> int:
@@ -121,28 +119,45 @@ class EventFusionService:
             except Exception:
                 current_dt = None
 
-        # 1.5 针对非漫展小众日程，直接 100% 旁路时空粗筛与裁判合并，直接生成独立的超级节点
+        # 1.5 针对非漫展小众日程，进行智能旁路闸门过滤
         if event_type != "漫展":
-            fingerprint = f"{city_cleaned.lower()}_{name_slug}"
-            base_fingerprint = fingerprint
-            counter = 1
-            while True:
-                cursor.execute("SELECT id FROM normalized_events WHERE event_fingerprint = ?;", (fingerprint,))
-                if not cursor.fetchone():
+            # 1. 检测并去除地级市名头部前缀以定位基础词
+            base_slug = name_slug
+            for city in MAJOR_CITIES_COMBINED:
+                if name_slug.startswith(city.lower()):
+                    base_slug = name_slug[len(city):]
                     break
-                fingerprint = f"{base_fingerprint}_{counter}"
-                counter += 1
-                
-            cursor.execute(
-                """
-                INSERT INTO normalized_events (event_fingerprint, standard_name, city, start_date, end_date, event_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?);
-                """,
-                (fingerprint, event_name_cleaned, city_cleaned, event_date if current_dt else None, event_date if current_dt else None, event_type, now_str)
-            )
-            new_id = cursor.lastrowid
-            print(f"\x1b[1;32m[Fusion Engine Bypass] 成功旁路融合并为小众活动类型 '{event_type}' 创建超级节点 (ID: {new_id}): '{event_name_cleaned}' (📍 {city_cleaned})\x1b[0m")
-            return new_id
+            
+            # 2. 从配置动态获取旁路名单进行判定
+            bypass_list = set(settings.bypass_generic_names)
+            
+            if base_slug in bypass_list:
+                is_bypass = True
+            else:
+                # 针对极简泛词的降级过滤，如“摄影会”
+                no_city_name = not any(city in name_slug for city in MAJOR_CITIES_COMBINED)
+                is_bypass = (len(name_slug) <= 3 and no_city_name)
+            if is_bypass:
+                fingerprint = f"{city_cleaned.lower()}_{name_slug}"
+                base_fingerprint = fingerprint
+                counter = 1
+                while True:
+                    cursor.execute("SELECT id FROM normalized_events WHERE event_fingerprint = ?;", (fingerprint,))
+                    if not cursor.fetchone():
+                        break
+                    fingerprint = f"{base_fingerprint}_{counter}"
+                    counter += 1
+                    
+                cursor.execute(
+                    """
+                    INSERT INTO normalized_events (event_fingerprint, standard_name, city, start_date, end_date, event_type, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (fingerprint, event_name_cleaned, city_cleaned, event_date if current_dt else None, event_date if current_dt else None, event_type, now_str)
+                )
+                new_id = cursor.lastrowid
+                print(f"\x1b[1;32m[Fusion Engine Bypass] 成功旁路融合并为极简小众活动类型 '{event_type}' 创建超级节点 (ID: {new_id}): '{event_name_cleaned}' (📍 {city_cleaned})\x1b[0m")
+                return new_id
         
         # ======================================================================
         # 【入口 O(1) 字典匹配与时间窗口秒配、时空纠偏级联处理】
@@ -159,9 +174,9 @@ class EventFusionService:
             f"""
             SELECT id, event_fingerprint, standard_name, city, start_date, end_date
             FROM normalized_events
-            WHERE event_type = '漫展' AND (event_fingerprint IN ({placeholders}) OR (city IN (?, '未知') AND standard_name = ?));
+            WHERE event_type = ? AND (event_fingerprint IN ({placeholders}) OR (city IN (?, '未知') AND standard_name = ?));
             """,
-            (*fps, city_cleaned, event_name_cleaned)
+            (event_type, *fps, city_cleaned, event_name_cleaned)
         )
         candidates = cursor.fetchall()
         
@@ -175,9 +190,9 @@ class EventFusionService:
             SELECT ne.id, ne.event_fingerprint, ne.standard_name, ne.city, ne.start_date, ne.end_date
             FROM event_aliases ea
             JOIN normalized_events ne ON ea.normalized_event_id = ne.id
-            WHERE ea.alias_name = ? AND ea.city IN ({alias_placeholders}) AND ne.event_type = '漫展';
+            WHERE ea.alias_name = ? AND ea.city IN ({alias_placeholders}) AND ne.event_type = ?;
             """,
-            (name_slug, *alias_cities)
+            (name_slug, *alias_cities, event_type)
         )
         alias_candidates = cursor.fetchall()
         
@@ -287,9 +302,9 @@ class EventFusionService:
         cursor.execute(
             """
             SELECT id, event_fingerprint, standard_name, city, start_date, end_date FROM normalized_events
-            WHERE city = ? AND event_type = '漫展';
+            WHERE city = ? AND event_type = ?;
             """,
-            (city_cleaned,)
+            (city_cleaned, event_type)
         )
         existing_nodes = cursor.fetchall()
         

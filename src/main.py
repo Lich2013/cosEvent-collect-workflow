@@ -232,10 +232,21 @@ async def _async_process(limit, confidence_threshold):
     except Exception as e:
         click.secho(f"✗ 智能体提炼阶段遭遇严重阻断异常: {e}", fg="red")
         
+    click.echo("\n" + "=" * 40)
+    click.secho("🤖 步骤 3/3: 正在启动物化呈现视图滑动窗口重建...", fg="cyan", bold=True)
+    click.echo("=" * 40)
+    materialize_stats = None
+    try:
+        from src.services.db.materialize_service import MaterializeService
+        materialize_stats = MaterializeService.rebuild_view()
+    except Exception as e:
+        click.secho(f"✗ 物化展示表重建遭遇严重崩溃异常: {e}", fg="red")
+        
     # 输出四色总结报告
     click.echo("\n" + "=" * 40)
     click.secho("cosevent process 执行报告", fg="cyan", bold=True)
     click.echo("=" * 40)
+    
     click.secho("[Scraper 爬取摘要]:", fg="yellow", bold=True)
     click.echo(f"- 活跃 Coser 数量: {total_cosers} 人")
     click.echo(f"- 爬行成功平台数: 微博({success_platforms['weibo']['success']}/{success_platforms['weibo']['total']}), B站({success_platforms['bilibili']['success']}/{success_platforms['bilibili']['total']}), 小红书({success_platforms['xhs']['success']}/{success_platforms['xhs']['total']})")
@@ -245,6 +256,13 @@ async def _async_process(limit, confidence_threshold):
     click.echo(f"- 本次分析增量博文: {total_posts} 条")
     click.echo(f"- 成功提取 Cosplay 活动: {success_events_count} 个 (置信度 >= {confidence_threshold})")
     click.echo(f"- 标注已分析博文: {analyzed_count} 条")
+    
+    if materialize_stats:
+        click.secho("[Materializer 物化摘要]:", fg="cyan", bold=True)
+        click.echo(f"- 历史已冻结展示节点数: {materialize_stats['frozen_nodes']} 个")
+        click.echo(f"- 活跃日程聚类群组数: {materialize_stats['new_clusters']} 个")
+        click.echo(f"- 写入/更新超级展示节点数: {materialize_stats['new_normalized_nodes']} 个")
+        click.echo(f"- 本轮新增冻结展示节点数: {materialize_stats['newly_frozen_nodes']} 个")
     
     status_tracing = click.style("正常激活 (Local Langfuse)", fg="green") if is_langfuse_active() else click.style("已降级为本地日志审计", fg="yellow")
     click.echo(f"[Langfuse 追踪状态]: {status_tracing}")
@@ -306,6 +324,46 @@ def export_command(output, confidence_threshold, scope, fmt, view, event_type):
         click.secho(f"✓ 成功过滤并导出 {count} 条 Cosplay 活动数据至 {output}！", fg="green", bold=True)
     else:
         click.secho(f"✓ 成功过滤并输出 {count} 条 Cosplay 活动数据至标准输出！", err=True, fg="green", bold=True)
+
+
+@cli.command("deduplicate")
+def deduplicate_command():
+    """[Deduplicate] 一键物理去重并合并冗余的超级活动节点"""
+    init_db()
+    click.secho("⏳ 正在启动数据库存量超级节点一键式去重任务...", fg="cyan", bold=True)
+    from src.services.db.dedup_service import DeduplicationService
+    try:
+        stats = DeduplicationService.deduplicate_database()
+        click.secho("✓ 数据库存量超级节点去重合并成功完成！", fg="green", bold=True)
+        click.echo(f"- 处理重复组数: {stats['processed_groups']}")
+        click.echo(f"- 重定向日程数: {stats['merged_nodes']}")
+        click.echo(f"- 别名重定向数: {stats['alias_redirects']}")
+        click.echo(f"- 别名冲突合并数: {stats['alias_conflicts']}")
+        click.echo(f"- 物理清理冗余节点数: {stats['deleted_nodes']}")
+    except Exception as e:
+        click.secho(f"✗ 数据库物理去重阶段遭遇严重崩溃异常: {e}", fg="red", bold=True)
+        sys.exit(1)
+
+
+@cli.command("materialize")
+def materialize_command():
+    """[Materialize] 一键重建与滑动冷热窗口去重的物化展示表"""
+    init_db()
+    click.secho("⏳ 正在启动物化呈现视图一键重建与滑动去重任务...", fg="cyan", bold=True)
+    from src.services.db.materialize_service import MaterializeService
+    try:
+        stats = MaterializeService.rebuild_view()
+        click.secho("✓ 物化展示表及滑动去重重建成功完成！", fg="green", bold=True)
+        click.echo(f"- 历史已冻结展示节点数: {stats['frozen_nodes']}")
+        click.echo(f"- 活跃待处理日程总数: {stats['active_schedules']}")
+        click.echo(f"- 重定向至冻结节点日程数: {stats['mapped_to_frozen']}")
+        click.echo(f"- 活跃日程聚类群组数: {stats['new_clusters']}")
+        click.echo(f"- 写入/更新超级展示节点数: {stats['new_normalized_nodes']}")
+        click.echo(f"- 本轮新增冻结展示节点数: {stats['newly_frozen_nodes']}")
+    except Exception as e:
+        click.secho(f"✗ 物化展示表重建遭遇严重崩溃异常: {e}", fg="red", bold=True)
+        sys.exit(1)
+
 
 def main():
     init_observability()

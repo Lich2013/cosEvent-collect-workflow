@@ -70,3 +70,16 @@ def parse_city(place_str: str) -> str:
         return m_fallback.group(1)
         
     return "未知"
+
+def clean_event_name(name: str) -> str:
+    """
+    公共事件名称清洗函数：
+    对漫展名称做极简清洗，以便进行一致性及初步相似度计算。
+    """
+    if not name:
+        return ""
+    s = name.lower().strip()
+    s = s.replace("bw", "bilibiliworld").replace("cp", "comicup")
+    s = re.sub(r"[\s\-\_\,\.\!\?\#\&\*\/]", "", s)
+    return s
+

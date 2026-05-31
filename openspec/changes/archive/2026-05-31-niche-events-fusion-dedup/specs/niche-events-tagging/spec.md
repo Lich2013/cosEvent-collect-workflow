@@ -1,8 +1,5 @@
-# niche-events-tagging Specification
+## MODIFIED Requirements
 
-## Purpose
-二次元小众活动日程打标与值域校验规范。
-## Requirements
 ### Requirement: 智能二次元小众日程识别、提炼与值域防御
 系统必须能够智能识别、分流预检并提炼二次元小众线下日程（如一日店长、到店特邀模特、摄影会、快闪/签售等），并在物理存储与模型校验上进行严格的类型打标与值域双重防御。
 1. **预检分流（Triage）放行**：
@@ -20,6 +17,8 @@
 #### Scenario: 成功预检并提炼罗森一日店长小众日程
 - **WHEN** 解析博文内容“11月8日沪闵路9505号～ Nikke罗森一日店长，大家到时候见哦！”且该博文发表时间为 `2026-11-01`
 - **THEN** 系统判定 `has_event` 为 `True`，Extractor 提取出的 `event_type` 值为 "一日店长"，城市提取为 "上海"，日期提取为 "2026-11-08"，且在保存数据库前成功通过 `validate_type` 断言校验，并进入融合引擎匹配
+
+## ADDED Requirements
 
 ### Requirement: 专有名词小众日程智能闸门化融合
 系统在处理二次元小众活动（`event_type != "漫展"`）时，必须执行智能旁路闸门（Gated Bypass）机制：
@@ -49,4 +48,3 @@
 #### Scenario: 成功运行一键式去重且不发生别名表死锁崩溃
 - **WHEN** 命令行调用 `uv run python src/main.py deduplicate` 运行去重清洗
 - **THEN** 系统在同一个原子事务中，将冗余的“石家庄Mars EXPO签售”超级节点在 ±7 天窗口内成功重定向，在 alias 冲突时输出 Audit 日志并合并，安全物理清理 Loser 超级节点，整个事务成功提交且无任何 `sqlite3` 崩溃报错
-

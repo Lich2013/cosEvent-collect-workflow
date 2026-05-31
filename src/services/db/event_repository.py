@@ -287,6 +287,13 @@ class EventRepository:
                     (raw_post_id,)
                 )
                 
+            # 在主事务提交后，自动触发一次快速物化视图重建，确保数据实时一致性
+            try:
+                from src.services.db.materialize_service import MaterializeService
+                MaterializeService.rebuild_view()
+            except Exception as mat_err:
+                print(f"\x1b[1;33m[Materialize Warning] 自动物化重建失败，已忽略以防阻断分析: {mat_err}\x1b[0m")
+                
             return True
         except (AssertionError, sqlite3.IntegrityError, ValueError, TypeError, AttributeError) as permanent_err:
             # 结构性、永久性硬故障：回退后重新 raise 出来供外层执行熔断标记为 2

@@ -185,10 +185,14 @@ uv run python src/main.py scrape --limit 10 --name "池咲misa" --platform bilib
 # 支持通过 --confidence-threshold 过滤基准置信度 (默认 0.3)
 uv run python src/main.py analyze --confidence-threshold 0.3
 
-# 3. 统一调度进程 (依次顺序调用以上两者，完成闭环，输出漂亮的四色总结报告)
+# 3. 独立物化重建与离线去重任务 (在单一原子事务中，对活跃时间窗口内的日程运行 offline 聚类，更新物化呈现展示表)
+uv run python src/main.py materialize
+
+# 4. 统一调度进程 (顺序执行 scrape 爬取与 analyze 提炼后，在最末尾自动级联执行一次离线物化重建)
 uv run python src/main.py process
 ```
 * **细粒度过滤 (`--name` / `--platform`)**：在数据爬取阶段，你可以通过指定 `--name` 匹配特定的 Coser，指定 `--platform` 匹配特定的社交平台，系统将自动裁剪执行任务，旁路无需运行的 Scraper 实例和 Playwright 浏览器会话，大幅提升单点调试与更新的效率。不提供参数时自动回退为全量并发爬行。
+* **物化展示重建时机**：爬取分析和物化去重在物理上完全解耦以降低 SQLite 并发锁冲突。日程数据以只读状态存入 cosplay_events 事实表，展示层的数据一致性通过 `materialize` 重建指令（或 `process` 主任务链结束后自动级联调用）在原子写锁中一次性刷新物化表。
 
 #### 🔹 多格式与多范围精细过滤导出 (Export)
 ```bash

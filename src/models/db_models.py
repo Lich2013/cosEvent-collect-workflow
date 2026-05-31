@@ -94,6 +94,33 @@ def init_db():
             UNIQUE(alias_name, city)
         );
         """)
+
+        # 5.5 创建 event_mappings 表 (中间关联映射表，外键关联 cosplay_events.id)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS event_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_event_id INTEGER NOT NULL UNIQUE,
+            normalized_event_id VARCHAR(32) NOT NULL,
+            created_at TEXT,
+            FOREIGN KEY(raw_event_id) REFERENCES cosplay_events(id) ON DELETE CASCADE
+        );
+        """)
+
+        # 5.6 创建 final_exhibition_view 表 (物化呈现展示表，id 为 32 位 MD5 确定性哈希)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS final_exhibition_view (
+            id VARCHAR(32) PRIMARY KEY,
+            event_fingerprint TEXT UNIQUE,
+            standard_name TEXT NOT NULL,
+            city TEXT NOT NULL,
+            start_date TEXT,
+            end_date TEXT,
+            event_type TEXT DEFAULT '漫展',
+            is_frozen INTEGER DEFAULT 0,
+            created_at TEXT,
+            CHECK (event_type IN ('漫展', '一日店长', '摄影会', '受邀模特', '快闪/签售'))
+        );
+        """)
         
         # 6. 自动数据库热升级：检测并追加新列以支持微博编辑次数与发表时间控制
         cursor.execute("PRAGMA table_info(raw_posts);")
