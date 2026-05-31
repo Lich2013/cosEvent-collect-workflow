@@ -49,6 +49,13 @@ analysis_pipeline:
     model: "gpt-4o"
 
 # ==============================================================================
+# Bilibili gRPC First-Party API Credentials
+# ==============================================================================
+bilibili_grpc:
+  access_token: "${BILIBILI_ACCESS_TOKEN}"
+  mid: "${BILIBILI_MID}"
+
+# ==============================================================================
 # Fusion Bypass Generic Names List (Bypass Gated Fusion logic to prevent collapse)
 # ==============================================================================
 bypass_generic_names:
