@@ -131,6 +131,11 @@ cp .env.example .env
 # BILIBILI_ACCESS_TOKEN, BILIBILI_MID (B 站移动端第一方 gRPC 凭证，若缺失将自动降级为 Playwright 网页抓取)
 ```
 
+> 💡 **B 站移动端第一方 gRPC 凭证获取指引**
+> * **如何获取**：使用 PC 端抓包工具（如 **Charles** 或 **Fiddler**）在手机/模拟器上拦截 B 站移动端 APP 请求流量。登录或刷新 APP 后，在 Host 包含 `bilibili.com`（如 `api.bilibili.com`）的请求参数或路径中，找到 **`access_key`** 参数（形如 `access_key=32位字母数字`），复制并填入 `.env` 中的 `BILIBILI_ACCESS_TOKEN`，同时将您的 B 站账号数字 UID 填入 `BILIBILI_MID` 即可。
+> * **无痛降级**：如果无需/不想使用抓包，可**直接留空**上述两项。系统会自动友好降级为 Playwright 网页渲染抓取，您只需在 `config/cookies/bilibili_cookies.json` 中放入网页端的 Cookie 即可完美运行。
+
+
 > ⚠️ **安全警示**：为了防止 API Key 随 Git 泄露，请务必在 `config/settings.yaml` 中使用 `api_key: "${ENV_VAR}"` 环境变量占位符语法，并将真实的密钥配置在 `.env` 或系统环境变量中！请勿将明文 API Key 直接写入 YAML 配置文件中！
 
 并在 `config/cookies/` 目录下放置您账号的种子 Cookie 文件。为了提供极佳的使用体验，系统已实现**双模自适应兼容**：
