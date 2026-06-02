@@ -2,6 +2,7 @@ import os
 import sys
 import datetime
 import pytest
+import grpc
 from unittest.mock import patch, MagicMock, AsyncMock
 
 # Ensure the root directory is in python search path
@@ -473,3 +474,110 @@ def test_bio_db_version_control():
     assert "上海CP30" in rows[1][2]
     assert rows[1][3] == 0 # 自动重置为 0，以便增量引擎能够将其捕获！
     conn.close()
+
+
+# ==============================================================================
+# 单元测试：B站 gRPC Token 自动检测、自愈刷新与持久化配置自更新
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_bilibili_grpc_token_auto_refresh(tmp_path):
+    scraper = BilibiliScraper()
+    
+    # 1. 模拟一个临时的 .env 配置文件，初始为过期 Token 和注释的 refresh_token
+    temp_dotenv = tmp_path / ".env"
+    temp_dotenv.write_text(
+        "BILIBILI_ACCESS_TOKEN=old_expired_access_token_123\n"
+        "# BILIBILI_REFRESH_TOKEN=old_refresh_token_456\n"
+        "BILIBILI_MID=3546926995737116\n",
+        encoding="utf-8"
+    )
+    
+    # 2. 覆盖 settings 中的凭据为旧凭证
+    original_access = settings.bilibili_grpc_access_token
+    original_refresh = settings.bilibili_grpc_refresh_token
+    settings.bilibili_grpc_access_token = "old_expired_access_token_123"
+    settings.bilibili_grpc_refresh_token = "old_refresh_token_456"
+    
+    # 重写 _update_dotenv 指向我们临时的 .env 文件，以完整测试正则替换和解除注释逻辑
+    def test_update_dotenv(access_token, refresh_token):
+        import re
+        content = temp_dotenv.read_text(encoding="utf-8")
+        if "BILIBILI_ACCESS_TOKEN" in content:
+            content = re.sub(
+                r"^BILIBILI_ACCESS_TOKEN\s*=.*$",
+                f"BILIBILI_ACCESS_TOKEN={access_token}",
+                content,
+                flags=re.MULTILINE
+            )
+        if "BILIBILI_REFRESH_TOKEN" in content:
+            content = re.sub(
+                r"^#?\s*BILIBILI_REFRESH_TOKEN\s*=.*$",
+                f"BILIBILI_REFRESH_TOKEN={refresh_token}",
+                content,
+                flags=re.MULTILINE
+            )
+        temp_dotenv.write_text(content, encoding="utf-8")
+        
+    scraper._update_dotenv = test_update_dotenv
+
+    # 3. 模拟 B站 Token 刷新接口成功的 JSON 响应
+    mock_refresh_response = {
+        "code": 0,
+        "message": "0",
+        "ttl": 1,
+        "data": {
+            "access_token": "brand_new_access_token_789",
+            "refresh_token": "brand_new_refresh_token_abc",
+            "expires_in": 15552000,
+            "mid": 3546926995737116
+        }
+    }
+    
+    # 4. 模拟 gRPC 首次调用由于 Token 过期报错，第二次重试调用成功的机制
+    call_count = 0
+    mock_posts = [{"post_id": "12345", "content": "测试动态", "published_at": "2026-06-03 10:00:00"}]
+    
+    async def mock_grpc_internal(uid, limit):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # 模拟 gRPC 报错 RpcError -101 (账号未登录/Token过期)
+            class MockRpcError(grpc.RpcError):
+                def code(self):
+                    return grpc.StatusCode.UNAUTHENTICATED
+                def __str__(self):
+                    return "RpcError: code = -101, message = identify_v1 signature invalid"
+            raise MockRpcError()
+        # 第二次重试成功返回
+        return mock_posts
+
+    # 5. Patch 底层接口和 HTTP 刷新接口
+    with patch.object(scraper, "_fetch_bilibili_posts_grpc_internal", side_effect=mock_grpc_internal), \
+         patch("requests.post") as mock_post:
+         
+        mock_http_resp = MagicMock()
+        mock_http_resp.status_code = 200
+        mock_http_resp.json.return_value = mock_refresh_response
+        mock_post.return_value = mock_http_resp
+        
+        # 6. 执行 gRPC 抓取（支持自愈刷新）
+        res = await scraper.fetch_bilibili_posts_grpc("3546926995737116", 5)
+        
+        # 7. 各种核心自愈断言验证
+        assert res == mock_posts
+        assert call_count == 2  # 成功触发了 1 次过期报错 + 1 次成功重试
+        
+        # 验证 settings 内存值已被热更新
+        assert settings.bilibili_grpc_access_token == "brand_new_access_token_789"
+        assert settings.bilibili_grpc_refresh_token == "brand_new_refresh_token_abc"
+        
+        # 验证物理 .env 文件已被热重写，且 refresh_token 已成功解除注释！
+        env_content = temp_dotenv.read_text(encoding="utf-8")
+        assert "BILIBILI_ACCESS_TOKEN=brand_new_access_token_789" in env_content
+        assert "BILIBILI_REFRESH_TOKEN=brand_new_refresh_token_abc" in env_content
+        assert "# BILIBILI_REFRESH_TOKEN" not in env_content  # 被成功解除注释并激活！
+        
+    # 8. 恢复原来的 settings 变量
+    settings.bilibili_grpc_access_token = original_access
+    settings.bilibili_grpc_refresh_token = original_refresh
+

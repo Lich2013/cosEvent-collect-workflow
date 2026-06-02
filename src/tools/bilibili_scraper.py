@@ -114,6 +114,22 @@ def _extract_text_and_author_from_item(item):
                 
     return author_name, content_text, ptime_label, orig_item
 
+# Bilibili 已知的各客户端 AppKey 与 AppSecret，用于刷新 Token 时自动匹配签名算法
+APP_CREDENTIALS = {
+    "android_hd": {
+        "appkey": "dfca71928277209b",
+        "appsec": "b5475a8825547a4fc26c7d518eaaa02e"
+    },
+    "android": {
+        "appkey": "783bbb7264451d82",
+        "appsec": "2653583c8873dea268ab9386918b1d65"
+    },
+    "tv": {
+        "appkey": "4409e2ce8ffd12b8",
+        "appsec": "59b43e04ad6965f34319062b478f83dd"
+    }
+}
+
 class BilibiliScraper(BaseScraper):
     def __init__(self):
         super().__init__("bilibili")
@@ -239,8 +255,8 @@ class BilibiliScraper(BaseScraper):
 
         return is_edited, now.strftime("%Y-%m-%d %H:%M:%S")
 
-    async def fetch_bilibili_posts_grpc(self, uid: str, limit: int = None) -> list[dict]:
-        """通过 B 站第一方移动端 gRPC 接口抓取空间动态"""
+    async def _fetch_bilibili_posts_grpc_internal(self, uid: str, limit: int = None) -> list[dict]:
+        """通过 B 站第一方移动端 gRPC 接口抓取空间动态（底层执行逻辑）"""
         access_token = settings.bilibili_grpc_access_token
         mid_val = settings.bilibili_grpc_mid
         
@@ -451,6 +467,142 @@ class BilibiliScraper(BaseScraper):
             })
 
         return posts
+
+    async def fetch_bilibili_posts_grpc(self, uid: str, limit: int = None) -> list[dict]:
+        """通过 B 站第一方移动端 gRPC 接口抓取空间动态（支持自愈式 Token 自动刷新与重试）"""
+        try:
+            return await self._fetch_bilibili_posts_grpc_internal(uid, limit)
+        except Exception as e:
+            refresh_token = getattr(settings, "bilibili_grpc_refresh_token", "")
+            if self._is_bili_grpc_auth_error(e) and refresh_token:
+                print(f"\x1b[1;33m[Scraper Warning] 检测到 B站 gRPC 凭证失效/过期: {e}，正在尝试使用 refresh_token 自愈刷新...\x1b[0m")
+                success = await self.refresh_bilibili_grpc_token()
+                if success:
+                    print("\x1b[1;32m[Scraper] B站 Token 自动置换成功，正在重试 gRPC 抓取...\x1b[0m")
+                    return await self._fetch_bilibili_posts_grpc_internal(uid, limit)
+            raise e
+
+    def _is_bili_grpc_auth_error(self, e: Exception) -> bool:
+        """精准判定异常是否为 B站 gRPC 鉴权失败或 Token 过期"""
+        if not isinstance(e, grpc.RpcError):
+            err_str = str(e).lower()
+            if "identify_v1" in err_str or "-101" in err_str or "unauthenticated" in err_str or "signature" in err_str:
+                return True
+            return False
+            
+        err_str = str(e).lower()
+        if "identify_v1" in err_str or "-101" in err_str or "unauthenticated" in err_str or "signature" in err_str:
+            return True
+            
+        try:
+            if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                return True
+        except AttributeError:
+            pass
+            
+        return False
+
+    async def refresh_bilibili_grpc_token(self) -> bool:
+        """调用 B站 接口使用 refresh_token 刷新 access_token"""
+        access_token = getattr(settings, "bilibili_grpc_access_token", "")
+        refresh_token = getattr(settings, "bilibili_grpc_refresh_token", "")
+        mobi_app = getattr(settings, "bilibili_grpc_mobi_app", "android_hd")
+        
+        if not refresh_token:
+            print("\x1b[1;31m[Scraper Error] refresh_token 为空，无法自动刷新 Token。\x1b[0m")
+            return False
+            
+        cred = APP_CREDENTIALS.get(mobi_app, APP_CREDENTIALS["android_hd"])
+        appkey = cred["appkey"]
+        appsec = cred["appsec"]
+        
+        ts = int(time.time())
+        params = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "appkey": appkey,
+            "ts": ts
+        }
+        
+        sorted_params = sorted(params.items())
+        query_str = "&".join([f"{k}={v}" for k, v in sorted_params])
+        sign_str = query_str + appsec
+        params["sign"] = hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+        
+        url = "https://passport.bilibili.com/api/v2/oauth2/refresh_token"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 BiliTV/1.0.0"
+        }
+        
+        try:
+            import requests
+            def _post_refresh():
+                r = requests.post(url, data=params, headers=headers, timeout=10)
+                return r.status_code, r.json()
+                
+            status_code, res_json = await asyncio.to_thread(_post_refresh)
+            
+            if status_code != 200:
+                print(f"\x1b[1;31m[Scraper Error] 刷新 Token 失败，HTTP 状态码: {status_code}\x1b[0m")
+                return False
+                
+            if res_json.get("code") != 0:
+                print(f"\x1b[1;31m[Scraper Error] 刷新 Token 接口返回错误: {res_json.get('message')} (code: {res_json.get('code')})\x1b[0m")
+                return False
+                
+            token_data = res_json["data"]
+            new_access = token_data["access_token"]
+            new_refresh = token_data["refresh_token"]
+            
+            print(f"\x1b[1;32m[Scraper] B站 Token 刷新成功！新 Access Token: {new_access[:6]}..., 新 Refresh Token: {new_refresh[:6]}...\x1b[0m")
+            
+            settings.bilibili_grpc_access_token = new_access
+            settings.bilibili_grpc_refresh_token = new_refresh
+            
+            self._update_dotenv(new_access, new_refresh)
+            return True
+        except Exception as e:
+            print(f"\x1b[1;31m[Scraper Error] 刷新 B站 Token 发生异常: {e}\x1b[0m")
+            return False
+
+    def _update_dotenv(self, access_token: str, refresh_token: str):
+        """将新获取的 Access Token 和 Refresh Token 物理更新写入根目录下的 .env 文件中"""
+        try:
+            from pathlib import Path
+            project_root = Path(__file__).resolve().parent.parent.parent
+            dotenv_path = project_root / ".env"
+            
+            if not dotenv_path.exists():
+                print(f"\x1b[1;33m[Scraper Warning] 未找到 .env 配置文件，无法执行持久化写入 (路径: {dotenv_path})\x1b[0m")
+                return
+                
+            content = dotenv_path.read_text(encoding="utf-8")
+            
+            if "BILIBILI_ACCESS_TOKEN" in content:
+                content = re.sub(
+                    r"^BILIBILI_ACCESS_TOKEN\s*=.*$",
+                    f"BILIBILI_ACCESS_TOKEN={access_token}",
+                    content,
+                    flags=re.MULTILINE
+                )
+            else:
+                content += f"\nBILIBILI_ACCESS_TOKEN={access_token}"
+                
+            if "BILIBILI_REFRESH_TOKEN" in content:
+                content = re.sub(
+                    r"^#?\s*BILIBILI_REFRESH_TOKEN\s*=.*$",
+                    f"BILIBILI_REFRESH_TOKEN={refresh_token}",
+                    content,
+                    flags=re.MULTILINE
+                )
+            else:
+                content += f"\nBILIBILI_REFRESH_TOKEN={refresh_token}"
+                
+            dotenv_path.write_text(content, encoding="utf-8")
+            print("\x1b[1;32m[Scraper] 成功将最新凭据持久化写入至项目 .env 文件！\x1b[0m")
+        except Exception as e:
+            print(f"\x1b[1;31m[Scraper Error] 持久化更新 .env 配置文件失败: {e}\x1b[0m")
 
     async def fetch_bilibili_posts(self, uid: str, limit: int = None) -> list[dict]:
         """抓取指定用户的B站动态列表"""

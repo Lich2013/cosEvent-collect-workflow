@@ -53,6 +53,7 @@ analysis_pipeline:
 # ==============================================================================
 bilibili_grpc:
   access_token: "${BILIBILI_ACCESS_TOKEN}"
+  refresh_token: "${BILIBILI_REFRESH_TOKEN}"
   mid: "${BILIBILI_MID}"
   mobi_app: "${BILIBILI_MOBI_APP}"
   device: "${BILIBILI_DEVICE}"

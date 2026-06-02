@@ -21,6 +21,7 @@ class Settings:
         
         # Bilibili gRPC 凭证默认值
         self.bilibili_grpc_access_token = ""
+        self.bilibili_grpc_refresh_token = ""
         self.bilibili_grpc_mid = 0
         self.bilibili_grpc_mobi_app = "android_hd"
         self.bilibili_grpc_device = "pad"
@@ -69,6 +70,7 @@ class Settings:
                         
                         bili_grpc = data.get("bilibili_grpc", {}) or {}
                         self.bilibili_grpc_access_token = bili_grpc.get("access_token", "")
+                        self.bilibili_grpc_refresh_token = bili_grpc.get("refresh_token", "")
                         self.bilibili_grpc_mid = bili_grpc.get("mid", 0)
                         self.bilibili_grpc_mobi_app = bili_grpc.get("mobi_app", "android_hd")
                         self.bilibili_grpc_device = bili_grpc.get("device", "pad")
@@ -78,6 +80,7 @@ class Settings:
 
         # 解析环境变量插值与从环境直接读取兜底
         self.bilibili_grpc_access_token = self._resolve_env_var(self.bilibili_grpc_access_token)
+        self.bilibili_grpc_refresh_token = self._resolve_env_var(self.bilibili_grpc_refresh_token)
         self.bilibili_grpc_mid = self._resolve_env_var(self.bilibili_grpc_mid)
         self.bilibili_grpc_mobi_app = self._resolve_env_var(self.bilibili_grpc_mobi_app)
         self.bilibili_grpc_device = self._resolve_env_var(self.bilibili_grpc_device)
@@ -85,6 +88,8 @@ class Settings:
 
         if not self.bilibili_grpc_access_token:
             self.bilibili_grpc_access_token = os.environ.get("BILIBILI_ACCESS_TOKEN", "")
+        if not self.bilibili_grpc_refresh_token:
+            self.bilibili_grpc_refresh_token = os.environ.get("BILIBILI_REFRESH_TOKEN", "")
         if not self.bilibili_grpc_mid:
             mid_env = os.environ.get("BILIBILI_MID", "0")
             if str(mid_env).isdigit():

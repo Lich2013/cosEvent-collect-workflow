@@ -129,7 +129,64 @@ def main():
                 print("==================================================")
                 print("\n✅ 配置指引：")
                 print("1. 请复制上方完整的 access_token 并配置到您项目的 `.env` 文件中的 `BILIBILI_ACCESS_TOKEN` 变量。")
-                print(f"2. 请将 `BILIBILI_MID` 设置为: {mid}")
+                print("2. 请复制上方完整的 refresh_token 并配置到您项目的 `.env` 文件中的 `BILIBILI_REFRESH_TOKEN` 变量。")
+                print(f"3. 请将 `BILIBILI_MID` 设置为: {mid}")
+                
+                # 交互式自动保存到项目 .env 中
+                save_choice = input("\n是否要自动将这些变量保存到项目根目录的 .env 文件中？(y/n, 默认 y): ").strip().lower()
+                if not save_choice or save_choice == "y":
+                    try:
+                        from pathlib import Path
+                        import re
+                        
+                        project_root = Path(__file__).resolve().parent.parent
+                        dotenv_path = project_root / ".env"
+                        
+                        if dotenv_path.exists():
+                            content = dotenv_path.read_text(encoding="utf-8")
+                            
+                            # 1. 替换或追加 BILIBILI_ACCESS_TOKEN
+                            if "BILIBILI_ACCESS_TOKEN" in content:
+                                content = re.sub(
+                                    r"^BILIBILI_ACCESS_TOKEN\s*=.*$",
+                                    f"BILIBILI_ACCESS_TOKEN={access_token}",
+                                    content,
+                                    flags=re.MULTILINE
+                                )
+                            else:
+                                content += f"\nBILIBILI_ACCESS_TOKEN={access_token}"
+                                
+                            # 2. 替换或追加 BILIBILI_REFRESH_TOKEN
+                            if "BILIBILI_REFRESH_TOKEN" in content:
+                                content = re.sub(
+                                    r"^#?\s*BILIBILI_REFRESH_TOKEN\s*=.*$",
+                                    f"BILIBILI_REFRESH_TOKEN={refresh_token}",
+                                    content,
+                                    flags=re.MULTILINE
+                                )
+                            else:
+                                content += f"\nBILIBILI_REFRESH_TOKEN={refresh_token}"
+                                
+                            # 3. 替换或追加 BILIBILI_MID
+                            if "BILIBILI_MID" in content:
+                                content = re.sub(
+                                    r"^BILIBILI_MID\s*=.*$",
+                                    f"BILIBILI_MID={mid}",
+                                    content,
+                                    flags=re.MULTILINE
+                                )
+                            else:
+                                content += f"\nBILIBILI_MID={mid}"
+                                
+                            dotenv_path.write_text(content, encoding="utf-8")
+                            print("🚀 [成功] 已成功自动将凭证保存至项目根目录的 .env 文件中！")
+                        else:
+                            # 如果 .env 不存在，则物理创建之
+                            dotenv_content = f"BILIBILI_ACCESS_TOKEN={access_token}\nBILIBILI_REFRESH_TOKEN={refresh_token}\nBILIBILI_MID={mid}\n"
+                            dotenv_path.write_text(dotenv_content, encoding="utf-8")
+                            print("🚀 [成功] 未找到 .env，已在项目根目录自动创建并保存凭证！")
+                    except Exception as env_err:
+                        print(f"❌ [错误] 自动更新 .env 文件失败: {env_err}，请手动进行配置。")
                 
                 if choice == "2":
                     print("\n💡 特别提示：由于您使用了 HD (安卓平板版) AppKey，为了保证 gRPC 请求头部信息完美契合该 Token，")
