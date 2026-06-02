@@ -18,15 +18,34 @@ class WeiboScraper(BaseScraper):
             page = await context.new_page()
             posts = []
             
+            # 注册网络响应拦截，提取 Weibo Bio
+            bio = ""
+            async def on_response(response):
+                nonlocal bio
+                if "weibo.com/ajax/profile/info" in response.url and response.status == 200:
+                    try:
+                        profile_data = await response.json()
+                        if "data" in profile_data and "user" in profile_data["data"]:
+                            u_desc = profile_data["data"]["user"].get("description")
+                            if u_desc:
+                                bio = u_desc.strip()
+                    except Exception:
+                        pass
+            page.on("response", on_response)
+
             # 使用 expect_response 拦截 Ajax 接口，实现极速稳定抓取
             target_url = f"https://weibo.com/u/{uid}"
-            async with page.expect_response(
-                lambda resp: "weibo.com/ajax/statuses/mymblog" in resp.url and resp.status == 200
-            ) as resp_info:
-                await page.goto(target_url)
-                
-            response = await resp_info.value
-            content = await response.json()
+            try:
+                async with page.expect_response(
+                    lambda resp: "weibo.com/ajax/statuses/mymblog" in resp.url and resp.status == 200,
+                    timeout=15000
+                ) as resp_info:
+                    await page.goto(target_url)
+                response = await resp_info.value
+                content = await response.json()
+            except Exception as e:
+                print(f"\x1b[1;33m[Scraper Warning] [weibo] 拦截 mymblog 失败 ({e})，尝试直接获取页面渲染\x1b[0m")
+                content = {}
             
             if "data" in content and "list" in content["data"]:
                 for item in content["data"]["list"][:limit]:
@@ -90,6 +109,40 @@ class WeiboScraper(BaseScraper):
                         "edit_count": edit_count,
                         "published_at": published_at
                     })
+            
+            # 若 mymblog 中含有 user 对象，作为二次降级尝试提取 Bio
+            if not bio and "data" in content and "list" in content["data"] and content["data"]["list"]:
+                for item in content["data"]["list"]:
+                    u_desc = item.get("user", {}).get("description")
+                    if u_desc:
+                        bio = u_desc.strip()
+                        break
+
+            # DOM / 元数据 meta description 降级兜底
+            if not bio:
+                try:
+                    meta_desc = await page.get_attribute('meta[name="description"]', 'content')
+                    if meta_desc:
+                        import re
+                        m = re.search(r"个人介绍：(.*?)(?:。|$)", meta_desc)
+                        if m:
+                            bio = m.group(1).strip()
+                except Exception as dom_err:
+                    print(f"\x1b[1;33m[Scraper Warning] [weibo] DOM 兜底解析失败: {dom_err}\x1b[0m")
+
+            # 组装虚拟推文注入（执行非空过滤门槛）
+            if bio and bio.strip():
+                import datetime
+                beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+                now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"\x1b[1;32m[Scraper] [weibo] 成功提取并合成了用户 Bio 虚拟动态: '{bio.strip()}'\x1b[0m")
+                posts.append({
+                    "post_id": f"bio_{uid}",
+                    "content": f"[个人简介] {bio.strip()}",
+                    "post_url": f"https://weibo.com/u/{uid}",
+                    "edit_count": 0,
+                    "published_at": now_str
+                })
             return posts
  
         return await self.scrape_flow_handler(_scrape_weibo, uid, limit)

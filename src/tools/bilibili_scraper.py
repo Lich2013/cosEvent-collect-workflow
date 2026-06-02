@@ -405,6 +405,51 @@ class BilibiliScraper(BaseScraper):
                 "is_edited": is_edited
             })
             
+        # 提取 signature 字段并合成为虚拟动态（执行非空过滤门槛）
+        bio = ""
+        for item in response.list:
+            for mod in item.modules:
+                which_item = mod.WhichOneof("module_item")
+                if which_item == "module_author":
+                    if mod.module_author.HasField("author") and mod.module_author.author.sign:
+                        bio = mod.module_author.author.sign.strip()
+                        break
+            if bio:
+                break
+
+        # B站 gRPC 模式个人简介 Card API 联动补爬与自愈
+        if not bio:
+            try:
+                import urllib.request
+                import json
+                card_url = f"https://api.bilibili.com/x/web-interface/card?mid={uid}"
+                req = urllib.request.Request(
+                    card_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+                )
+                
+                # 嵌套同步请求函数，由 asyncio.to_thread 承载以防死锁事件循环
+                def _get_card_bio():
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        card_data = json.loads(resp.read().decode("utf-8"))
+                        return card_data.get("data", {}).get("card", {}).get("sign", "").strip()
+                        
+                bio = await asyncio.to_thread(_get_card_bio)
+            except Exception as card_err:
+                print(f"\x1b[1;33m[Scraper Warning] [bilibili] [gRPC] 联动补爬 B站 Card API 失败: {card_err}\x1b[0m")
+
+        if bio and bio.strip():
+            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\x1b[1;32m[Scraper] [bilibili] [gRPC] 成功提取并合成了用户 Bio 虚拟动态: '{bio.strip()}'\x1b[0m")
+            posts.append({
+                "post_id": f"bio_{uid}",
+                "content": f"[个人简介] {bio.strip()}",
+                "post_url": f"https://space.bilibili.com/{uid}",
+                "edit_count": 0,
+                "published_at": now_str
+            })
+
         return posts
 
     async def fetch_bilibili_posts(self, uid: str, limit: int = None) -> list[dict]:
@@ -438,15 +483,32 @@ class BilibiliScraper(BaseScraper):
             page = await context.new_page()
             posts = []
             
+            # 注册网络响应拦截，提取 B站 签名 (Bio)
+            bio = ""
+            async def on_response(response):
+                nonlocal bio
+                if "api.bilibili.com/x/space/wbi/acc/info" in response.url and response.status == 200:
+                    try:
+                        acc_data = await response.json()
+                        if "data" in acc_data and acc_data["data"].get("sign"):
+                            bio = acc_data["data"]["sign"].strip()
+                    except Exception:
+                        pass
+            page.on("response", on_response)
+
             # 使用 expect_response 拦截 B站 动态列表 Ajax 接口
             target_url = f"https://space.bilibili.com/{uid}/dynamic"
-            async with page.expect_response(
-                lambda resp: "api.bilibili.com/x/polymer/web-dynamic/v1/feed" in resp.url and resp.status == 200
-            ) as resp_info:
-                await page.goto(target_url)
-                
-            response = await resp_info.value
-            content = await response.json()
+            try:
+                async with page.expect_response(
+                    lambda resp: "api.bilibili.com/x/polymer/web-dynamic/v1/feed" in resp.url and resp.status == 200,
+                    timeout=15000
+                ) as resp_info:
+                    await page.goto(target_url)
+                response = await resp_info.value
+                content = await response.json()
+            except Exception as e:
+                print(f"\x1b[1;33m[Scraper Warning] [bilibili] 拦截 feed 失败 ({e})，尝试直接获取页面渲染\x1b[0m")
+                content = {}
             
             if "data" in content and "items" in content["data"]:
                 for item in content["data"]["items"][:limit]:
@@ -498,7 +560,29 @@ class BilibiliScraper(BaseScraper):
                         "edit_count": 0,
                         "published_at": published_at
                     })
-                    
+            
+            # DOM 签名 (Bio) 降级兜底
+            if not bio:
+                try:
+                    sign_el = page.locator(".h-sign")
+                    if await sign_el.is_visible(timeout=3000):
+                        bio = (await sign_el.inner_text()).strip()
+                except Exception as dom_err:
+                    print(f"\x1b[1;33m[Scraper Warning] [bilibili] DOM 兜底解析签名失败: {dom_err}\x1b[0m")
+
+            # 组装虚拟推文注入（执行非空过滤门槛）
+            if bio and bio.strip():
+                import datetime
+                beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+                now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"\x1b[1;32m[Scraper] [bilibili] [Playwright] 成功提取并合成了用户 Bio 虚拟动态: '{bio.strip()}'\x1b[0m")
+                posts.append({
+                    "post_id": f"bio_{uid}",
+                    "content": f"[个人简介] {bio.strip()}",
+                    "post_url": f"https://space.bilibili.com/{uid}",
+                    "edit_count": 0,
+                    "published_at": now_str
+                })
             return posts
 
         return await self.scrape_flow_handler(_scrape_bili, uid, limit)

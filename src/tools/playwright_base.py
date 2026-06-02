@@ -4,7 +4,7 @@ import traceback
 import logging
 import datetime
 from pathlib import Path
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 from src.config import settings
 
 from src.utils.logger import log_event
@@ -103,11 +103,17 @@ class BaseScraper:
     async def get_browser_context(self, browser: Browser) -> BrowserContext:
         """根据持久化 state.json 或种子 Cookie 获取有状态的浏览器上下文，支持损坏自重构降级与过期检测"""
         context = None
+        user_agent_val = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        viewport_val = {"width": 1280, "height": 800}
         
         # 1. 优先尝试从本地 state.json 恢复会话（先检查 cookie 是否过期）
         if self.state_file.exists() and not self._check_state_cookies_expired():
             try:
-                context = await browser.new_context(storage_state=str(self.state_file))
+                context = await browser.new_context(
+                    storage_state=str(self.state_file),
+                    user_agent=user_agent_val,
+                    viewport=viewport_val
+                )
                 # 设置页面 15s 严格加载超时
                 context.set_default_timeout(settings.page_load_timeout_seconds * 1000)
                 return context
@@ -124,7 +130,10 @@ class BaseScraper:
                     print(f"\x1b[1;31m[Scraper ERROR] 删除过期会话文件失败: {unlink_err}\x1b[0m")
         
         # 2. 从零冷启动，注入静态种子 Cookie
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent=user_agent_val,
+            viewport=viewport_val
+        )
         context.set_default_timeout(settings.page_load_timeout_seconds * 1000)
         seed_cookies = self.load_seed_cookies()
         if seed_cookies:
@@ -160,7 +169,7 @@ class BaseScraper:
                 await context.storage_state(path=str(self.state_file))
                 return result
                 
-            except TimeoutError as te:
+            except (TimeoutError, PlaywrightTimeoutError) as te:
                 err_msg = f"页面在 {settings.page_load_timeout_seconds}s 内加载超时！优雅跳过当前爬行任务。"
                 print(f"\x1b[1;31m[Scraper Timeout ERROR] [{self.platform}] {err_msg}\x1b[0m")
                 log_event("ERROR", f"scraper_{self.platform}", err_msg, str(te))

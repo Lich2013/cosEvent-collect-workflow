@@ -203,8 +203,8 @@ class CoserRepository:
                                 (published_at, now_str, stored_id)
                             )
                         # 若未编辑且物理编辑时间、内容完全相同，则作为重复记录直接过滤去重
-                    # B站 Playwright 模式与小红书的自适应内容变动合成版本控制
-                    elif platform == "xhs" or (platform == "bilibili" and not post.get("is_grpc")):
+                    # B站 Playwright 模式与小红书以及所有平台的虚拟 Bio 动态的自适应内容变动合成版本控制
+                    elif platform == "xhs" or (platform == "bilibili" and not post.get("is_grpc")) or post_id.startswith("bio_"):
                         if content != stored_content:
                             # 内容发生变化，虚拟递增版本号
                             edit_count = stored_edit_count + 1
