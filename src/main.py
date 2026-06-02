@@ -282,14 +282,15 @@ def process_command(limit, confidence_threshold):
 @click.option("--by-event", is_flag=True, help="按漫展超级节点展现集结详情看板")
 @click.option("--confidence-threshold", default=0.0, type=float, help="置信度精筛阈值")
 @click.option("--type", "event_type", default=None, type=click.Choice(['漫展', '一日店长', '摄影会', '受邀模特', '快闪/签售']), help="按活动类型进行精细筛选看板")
-def summary_command(by_event, confidence_threshold, event_type):
+@click.option("--city", default=None, help="按地级市进行日程精筛选看板，例如 --city 上海")
+def summary_command(by_event, confidence_threshold, event_type, city):
     """[Dashboard] 展示 Cosplay 日程看板（支持按 Coser 或超级漫展聚合）"""
     init_db()
     if by_event:
-        events = DBService.get_event_centric_summary(confidence_threshold, event_type=event_type)
+        events = DBService.get_event_centric_summary(confidence_threshold, event_type=event_type, city=city)
         TerminalRenderer.render_event_centric_summary(events)
     else:
-        events = DBService.get_all_events(confidence_threshold, scope="all", event_type=event_type)
+        events = DBService.get_all_events(confidence_threshold, scope="all", event_type=event_type, city=city)
         TerminalRenderer.render_coser_centric_summary(events)
 
 @cli.command("calendar")

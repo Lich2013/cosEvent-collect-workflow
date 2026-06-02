@@ -125,15 +125,47 @@ uv sync
 复制并配置 `.env` 环境变量：
 ```bash
 cp .env.example .env
-# 编辑 .env 文件，填入：
-# OPENAI_API_KEY, OPENAI_API_BASE
-# LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST (默认为 http://localhost:3000)
-# BILIBILI_ACCESS_TOKEN, BILIBILI_MID (B 站移动端第一方 gRPC 凭证，若缺失将自动降级为 Playwright 网页抓取)
+# 编辑 .env 文件，填入相关的配置凭证。
 ```
 
-> 💡 **B 站移动端第一方 gRPC 凭证获取指引**
-> * **如何获取**：使用 PC 端抓包工具（如 **Charles** 或 **Fiddler**）在手机/模拟器上拦截 B 站移动端 APP 请求流量。登录或刷新 APP 后，在 Host 包含 `bilibili.com`（如 `api.bilibili.com`）的请求参数或路径中，找到 **`access_key`** 参数（形如 `access_key=32位字母数字`），复制并填入 `.env` 中的 `BILIBILI_ACCESS_TOKEN`，同时将您的 B 站账号数字 UID 填入 `BILIBILI_MID` 即可。
-> * **无痛降级**：如果无需/不想使用抓包，可**直接留空**上述两项。系统会自动友好降级为 Playwright 网页渲染抓取，您只需在 `config/cookies/bilibili_cookies.json` 中放入网页端的 Cookie 即可完美运行。
+> 💡 **B 站移动端第一方 gRPC 凭证获取及设备指引**
+> 
+> 为了让系统能稳定使用高精度的 gRPC 空间动态抓取并完美防范 B 站的风控安全拦截（如报错返回 `details = "-352"` 请求被拦截），请按以下步骤获取凭证并配置对齐指纹：
+> 
+> 1. **全自动扫码获取（强烈推荐）**：
+>    在终端中运行高级扫码登录脚本：
+>    ```bash
+>    uv run python scripts/bili_app_qr_login.py
+>    ```
+>    - 运行后，终端会提示您选择模拟客户端。**强烈推荐选择 `[2] Bilibili HD (安卓平板版)`**。
+>    - 使用您手机上的 B 站 App 扫描终端里渲染出的二维码，并在手机上确认登录授权。
+>    - 授权成功后，终端会直接输出该客户端颁发的复合 `access_token`（长达 204 位）与数字 UID (`mid`)。
+>    *(注：如需运行基于经典小电视 TV 协议的旧版脚本，可执行 `uv run python scripts/bili_qr_login.py`)*
+> 
+> 2. **配置 `.env` 环境变量**：
+>    将获取到的凭证以及相配套的**指纹对齐变量**填入您项目根目录下的 `.env` 文件中：
+>    ```bash
+>    # B 站第一方 gRPC 凭证
+>    BILIBILI_ACCESS_TOKEN=a1b49b065884f76ee3... (复制终端返回的完整长字符串)
+>    BILIBILI_MID=3546926995737116
+> 
+>    # 🔹 客户端指纹对齐参数 (若在扫码时选择了 [2] Bilibili HD版，请如下配置以防 -352 拦截)
+>    BILIBILI_MOBI_APP=android_hd
+>    BILIBILI_DEVICE=pad
+>    BILIBILI_BUILD=1410100
+>    ```
+>    - **为何要配置指纹参数？**：B 站在网关层实行设备与凭证强绑定核验。当您配置了 `android_hd` 指纹时，系统的 gRPC 客户端会自动将底层请求伪装为 Huawei MatePad 平板设备，完美匹配平板端 Token 的颁发载体，实现 100% 绿灯无阻碍通行。
+> 
+> 3. **抓包备选获取**：
+>    如果选择手动抓包，可使用 PC 端抓包工具（如 **Charles** 或 **Fiddler**）在手机上拦截 B 站移动端 APP 流量。在 Host 包含 `bilibili.com` 的请求路径中找到 `access_key`（32位小写Hex），复制填入 `BILIBILI_ACCESS_TOKEN`，同时将 `BILIBILI_MID` 设置为您的账户数字 ID。此情况下对应的指纹配置应为默认的手机版配置：
+>    ```bash
+>    BILIBILI_MOBI_APP=android
+>    BILIBILI_DEVICE=phone
+>    BILIBILI_BUILD=8410300
+>    ```
+> 
+> 4. **无痛降级**：
+>    如果您不需要或不想使用 gRPC 抓取，可**直接留空**上述 `BILIBILI_` 相关的所有配置。系统在运行时会自动友好降级为 Playwright 无头网页渲染抓取，您只需在 `config/cookies/bilibili_cookies.json` 中放入您浏览器端普通的 B 站 Cookie 即可完美运行。
 
 
 > ⚠️ **安全警示**：为了防止 API Key 随 Git 泄露，请务必在 `config/settings.yaml` 中使用 `api_key: "${ENV_VAR}"` 环境变量占位符语法，并将真实的密钥配置在 `.env` 或系统环境变量中！请勿将明文 API Key 直接写入 YAML 配置文件中！
@@ -227,12 +259,16 @@ uv run python src/main.py summary
 # 2. 漫展视角：以超级漫展节点为外层，嵌套展示参展 Coser 信息、扮演角色与摊位
 uv run python src/main.py summary --by-event
 
-# 3. 按活动类型精筛 (可与 --by-event 组合使用)
-uv run python src/main.py summary --by-event --type 一日店长
-uv run python src/main.py summary --type 摄影会
+# 3. 按地级市进行精细筛选 (支持 Coser 视图与漫展视图)
+uv run python src/main.py summary --city 上海
+uv run python src/main.py summary --by-event --city 上海
+
+# 4. 按活动类型与城市精筛联合使用
+uv run python src/main.py summary --by-event --type 一日店长 --city 上海
 ```
 
 * **`--by-event`**：切换为以归一化漫展（`normalized_events`）为大节点的层次化视图，嵌套展示各漫展下所有参展 Coser 的昵称、日期、扮演角色与摊位号（完全通过数据库物理联查，零 LLM 幻觉）。
+* **`--city`**：支持按地级市名称精确过滤日程大看板，省略时默认展示全量城市。
 * **`--type`**：支持 `漫展`、`一日店长`、`摄影会`、`受邀模特`、`快闪/签售` 五类精筛过滤，省略时默认输出全量日程。
 
 #### 🔹 时间轴日历看板 (Calendar)

@@ -4,8 +4,8 @@ from src.models.db_models import get_db_connection
 
 class QueryService:
     @staticmethod
-    def get_all_events(confidence_threshold: float = 0.0, scope: str = "all", event_type: str = None) -> list[dict]:
-        """获取所有置信度高于阈值的有效活动，支持按范围与活动类型分流"""
+    def get_all_events(confidence_threshold: float = 0.0, scope: str = "all", event_type: str = None, city: str = None) -> list[dict]:
+        """获取所有置信度高于阈值的有效活动，支持按范围与活动类型及地级市分流"""
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -13,7 +13,8 @@ class QueryService:
             SELECT 
                 ce.id, ce.raw_post_id, ce.coser_name, ce.event_name, ce.event_date, ce.event_place, ce.event_description, ce.confidence, ce.source_url, ce.created_at,
                 COALESCE(ne.start_date, old_ne.start_date) AS start_date,
-                COALESCE(ne.end_date, old_ne.end_date) AS end_date
+                COALESCE(ne.end_date, old_ne.end_date) AS end_date,
+                COALESCE(ne.city, old_ne.city) AS city
             FROM cosplay_events ce
             LEFT JOIN event_mappings em ON ce.id = em.raw_event_id
             LEFT JOIN final_exhibition_view ne ON em.normalized_event_id = ne.id
@@ -25,6 +26,10 @@ class QueryService:
             if event_type:
                 sql += " AND ce.event_type = ?"
                 params.append(event_type)
+                
+            if city:
+                sql += " AND COALESCE(ne.city, old_ne.city) = ?"
+                params.append(city)
             
             if scope == "future":
                 beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
@@ -56,7 +61,8 @@ class QueryService:
                     "event_description": r[6],
                     "confidence": r[7],
                     "source_url": r[8],
-                    "created_at": r[9]
+                    "created_at": r[9],
+                    "city": r[12] or "未知"
                 })
             return result
         finally:
@@ -64,9 +70,9 @@ class QueryService:
             conn.close()
 
     @staticmethod
-    def get_event_centric_summary(confidence_threshold: float = 0.0, event_type: str = None) -> list[dict]:
+    def get_event_centric_summary(confidence_threshold: float = 0.0, event_type: str = None, city: str = None) -> list[dict]:
         """
-        获取以漫展为维度的集结大看板数据，支持按活动类型筛选
+        获取以漫展为维度的集结大看板数据，支持按活动类型与地级市精细筛选
         """
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -129,6 +135,9 @@ class QueryService:
             if event_type:
                 sql += " AND ce_event_type = ?"
                 params.append(event_type)
+            if city:
+                sql += " AND city = ?"
+                params.append(city)
             sql += " ORDER BY start_date IS NULL, start_date ASC, event_date IS NULL, event_date ASC;"
             cursor.execute(sql, tuple(params))
             rows = cursor.fetchall()

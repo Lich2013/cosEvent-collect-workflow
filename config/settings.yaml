@@ -54,6 +54,9 @@ analysis_pipeline:
 bilibili_grpc:
   access_token: "${BILIBILI_ACCESS_TOKEN}"
   mid: "${BILIBILI_MID}"
+  mobi_app: "${BILIBILI_MOBI_APP}"
+  device: "${BILIBILI_DEVICE}"
+  build: "${BILIBILI_BUILD}"
 
 # ==============================================================================
 # Dynamic Prefecture-level Cities Configuration

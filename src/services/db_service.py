@@ -59,12 +59,12 @@ class DBService:
     # 4. 只读聚合看板及时间轴日历查询委托 (读写分离 CQRS)
     # ==============================================================================
     @staticmethod
-    def get_all_events(confidence_threshold: float = 0.0, scope: str = "all", event_type: str = None) -> list[dict]:
-        return QueryService.get_all_events(confidence_threshold, scope, event_type)
+    def get_all_events(confidence_threshold: float = 0.0, scope: str = "all", event_type: str = None, city: str = None) -> list[dict]:
+        return QueryService.get_all_events(confidence_threshold, scope, event_type, city)
 
     @staticmethod
-    def get_event_centric_summary(confidence_threshold: float = 0.0, event_type: str = None) -> list[dict]:
-        return QueryService.get_event_centric_summary(confidence_threshold, event_type)
+    def get_event_centric_summary(confidence_threshold: float = 0.0, event_type: str = None, city: str = None) -> list[dict]:
+        return QueryService.get_event_centric_summary(confidence_threshold, event_type, city)
 
     @staticmethod
     def get_normalized_events(city: str = None, scope: str = "future", event_type: str = "漫展") -> list[dict]:

@@ -22,6 +22,9 @@ class Settings:
         # Bilibili gRPC 凭证默认值
         self.bilibili_grpc_access_token = ""
         self.bilibili_grpc_mid = 0
+        self.bilibili_grpc_mobi_app = "android_hd"
+        self.bilibili_grpc_device = "pad"
+        self.bilibili_grpc_build = 1410100
         
         # 动态自适应地级市列表
         self.custom_cities = []
@@ -67,12 +70,18 @@ class Settings:
                         bili_grpc = data.get("bilibili_grpc", {}) or {}
                         self.bilibili_grpc_access_token = bili_grpc.get("access_token", "")
                         self.bilibili_grpc_mid = bili_grpc.get("mid", 0)
+                        self.bilibili_grpc_mobi_app = bili_grpc.get("mobi_app", "android_hd")
+                        self.bilibili_grpc_device = bili_grpc.get("device", "pad")
+                        self.bilibili_grpc_build = bili_grpc.get("build", 1410100)
             except Exception as e:
                 print(f"\x1b[1;31m[Warning] 读取配置文件 settings.yaml 失败，使用系统默认配置: {e}\x1b[0m")
 
         # 解析环境变量插值与从环境直接读取兜底
         self.bilibili_grpc_access_token = self._resolve_env_var(self.bilibili_grpc_access_token)
         self.bilibili_grpc_mid = self._resolve_env_var(self.bilibili_grpc_mid)
+        self.bilibili_grpc_mobi_app = self._resolve_env_var(self.bilibili_grpc_mobi_app)
+        self.bilibili_grpc_device = self._resolve_env_var(self.bilibili_grpc_device)
+        self.bilibili_grpc_build = self._resolve_env_var(self.bilibili_grpc_build)
 
         if not self.bilibili_grpc_access_token:
             self.bilibili_grpc_access_token = os.environ.get("BILIBILI_ACCESS_TOKEN", "")
@@ -87,6 +96,22 @@ class Settings:
                 self.bilibili_grpc_mid = int(self.bilibili_grpc_mid)
             except (ValueError, TypeError):
                 self.bilibili_grpc_mid = 0
+
+        if not self.bilibili_grpc_mobi_app:
+            self.bilibili_grpc_mobi_app = os.environ.get("BILIBILI_MOBI_APP", "android_hd")
+        if not self.bilibili_grpc_device:
+            self.bilibili_grpc_device = os.environ.get("BILIBILI_DEVICE", "pad")
+        if not self.bilibili_grpc_build:
+            build_env = os.environ.get("BILIBILI_BUILD", "1410100")
+            try:
+                self.bilibili_grpc_build = int(build_env)
+            except (ValueError, TypeError):
+                self.bilibili_grpc_build = 1410100
+        else:
+            try:
+                self.bilibili_grpc_build = int(self.bilibili_grpc_build)
+            except (ValueError, TypeError):
+                self.bilibili_grpc_build = 1410100
 
         # 确保 runtime 文件夹及日志目录存在
         db_dir = Path(self.db_path).parent

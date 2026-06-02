@@ -259,13 +259,26 @@ class BilibiliScraper(BaseScraper):
         setattr(req, "from", "space")
         
         buvid_val = "XY6CBD464C1BC5767CE40A77F12B89222B6E7"
-        build_val = 8410300
-        fp_val = gen_fp(buvid_val, "Mi 11")
+        
+        mobi_app_val = settings.bilibili_grpc_mobi_app
+        device_val = settings.bilibili_grpc_device
+        build_val = settings.bilibili_grpc_build
+        
+        if mobi_app_val == "android_hd":
+            brand_val = "Huawei"
+            model_val = "MatePad"
+            version_name_val = "1.41.0"
+        else:
+            brand_val = "Xiaomi"
+            model_val = "Mi 11"
+            version_name_val = "8.41.0"
+            
+        fp_val = gen_fp(buvid_val, model_val)
         
         meta = metadata_pb2.Metadata(
             access_key=access_token,
-            mobi_app="android",
-            device="phone",
+            mobi_app=mobi_app_val,
+            device=device_val,
             build=build_val,
             channel="master",
             platform="android",
@@ -276,14 +289,13 @@ class BilibiliScraper(BaseScraper):
             app_id=1,
             build=build_val,
             buvid=buvid_val,
-            mobi_app="android",
+            mobi_app=mobi_app_val,
             platform="android",
-            device="phone",
-            channel="master",
-            brand="Xiaomi",
-            model="Mi 11",
+            device=device_val,
+            brand=brand_val,
+            model=model_val,
             osver="12",
-            version_name="8.41.0",
+            version_name=version_name_val,
             fp=fp_val,
             fp_local=fp_val,
             fp_remote=fp_val,
@@ -311,8 +323,10 @@ class BilibiliScraper(BaseScraper):
             env="prod"
         )
         
+        ua_val = f'Dalvik/2.1.0 (Linux; U; Android 12; {model_val} Build/SKQ1.211006.001) {version_name_val} os/android model/{model_val} mobi_app/{mobi_app_val} build/{build_val} channel/master innerVer/{build_val} grpc-java-cronet/1.36.1'
+        
         metadata = [
-            ('user-agent', 'Dalvik/2.1.0 (Linux; U; Android 12; Mi 11 Build/SKQ1.211006.001) 8.41.0 os/android model/Mi 11 mobi_app/android build/8410300 channel/master innerVer/8410300 grpc-java-cronet/1.36.1'),
+            ('user-agent', ua_val),
             ('x-bili-mid', str(mid_val)),
             ('x-bili-aurora-eid', gen_aurora_eid(mid_val)),
             ('x-bili-aurora-zone', ''),

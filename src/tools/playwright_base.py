@@ -77,17 +77,36 @@ class BaseScraper:
                     })
         return parsed_cookies
 
+    def _check_state_cookies_expired(self) -> bool:
+        """检查 state.json 中的关键 cookie 是否已过期，过期则返回 True"""
+        if not self.state_file.exists():
+            return True
+        try:
+            if self.state_file.stat().st_size == 0:
+                return True
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+            cookies = state.get("cookies", [])
+            now = datetime.datetime.now().timestamp()
+            for c in cookies:
+                expires = c.get("expires", -1)
+                if expires > 0 and expires < now:
+                    name = c.get("name", "?")
+                    exp_dt = datetime.datetime.fromtimestamp(expires)
+                    print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] cookie '{name}' 已于 {exp_dt.strftime('%Y-%m-%d %H:%M')} 过期，降级到种子 Cookie。\x1b[0m")
+                    return True
+            return False
+        except Exception as e:
+            print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] state.json 检查失败({e})，降级到种子 Cookie。\x1b[0m")
+            return True
+
     async def get_browser_context(self, browser: Browser) -> BrowserContext:
-        """根据持久化 state.json 或种子 Cookie 获取有状态的浏览器上下文，支持损坏自重构降级"""
+        """根据持久化 state.json 或种子 Cookie 获取有状态的浏览器上下文，支持损坏自重构降级与过期检测"""
         context = None
         
-        # 1. 优先尝试从本地 state.json 恢复会话
-        if self.state_file.exists():
+        # 1. 优先尝试从本地 state.json 恢复会话（先检查 cookie 是否过期）
+        if self.state_file.exists() and not self._check_state_cookies_expired():
             try:
-                # 检查文件是否为空
-                if self.state_file.stat().st_size == 0:
-                    raise json.JSONDecodeError("File is empty", "", 0)
-                    
                 context = await browser.new_context(storage_state=str(self.state_file))
                 # 设置页面 15s 严格加载超时
                 context.set_default_timeout(settings.page_load_timeout_seconds * 1000)
@@ -95,11 +114,14 @@ class BaseScraper:
             except (json.JSONDecodeError, Exception) as e:
                 # 本地 state.json 损坏或失效，执行删除恢复并友好降级到种子 Cookie
                 print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] 持久化 state.json 损坏或无法读取({e})，正在自动删除并降级冷启动...\x1b[0m")
+        else:
+            # state.json 不存在或 cookie 已过期，删除以触发种子 Cookie 重建
+            if self.state_file.exists():
+                print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] state.json 中 cookie 已过期，自动删除并降级到种子 Cookie。\x1b[0m")
                 try:
-                    if self.state_file.exists():
-                        self.state_file.unlink()
+                    self.state_file.unlink()
                 except Exception as unlink_err:
-                    print(f"\x1b[1;31m[Scraper ERROR] 删除损坏会话文件失败: {unlink_err}\x1b[0m")
+                    print(f"\x1b[1;31m[Scraper ERROR] 删除过期会话文件失败: {unlink_err}\x1b[0m")
         
         # 2. 从零冷启动，注入静态种子 Cookie
         context = await browser.new_context()
