@@ -15,6 +15,7 @@ load_dotenv()
 from src.config import settings
 from src.models.db_models import init_db
 from src.services.db_service import DBService
+from src.services.db.coser_repository import CoserRepository
 from src.services.export_service import ExportService
 from src.services.workflow_orchestrator import WorkflowOrchestrator
 from src.views.terminal_renderer import TerminalRenderer
@@ -43,6 +44,11 @@ def coser():
 def add_coser(name, weibo, bili, xhs):
     """添加一个新的 Coser 到数据库"""
     init_db()
+    # 前置校验名字相似度与平台 UID 占用冲突，并将警报输出到 stderr
+    warnings = CoserRepository.check_coser_duplicates(name, weibo, bili, xhs, check_name_similarity=True)
+    for warning in warnings:
+        click.secho(warning, fg="yellow", bold=True, err=True)
+
     if DBService.add_coser(name, weibo, bili, xhs):
         click.secho(f"✓ 成功注册 Coser [{name}] 并绑定 UID 凭证！", fg="green", bold=True)
     else:
@@ -64,8 +70,13 @@ def list_cosers():
 def update_coser(name, weibo, bili, xhs, active):
     """修改指定 Coser 的平台 UID 或启用状态"""
     init_db()
-    is_active = int(active) if active is not None else None
     
+    # 前置校验平台 UID 占用冲突（排除自身，不校验名字相似度），并将警报输出到 stderr
+    warnings = CoserRepository.check_coser_duplicates(name, weibo, bili, xhs, exclude_name=name, check_name_similarity=False)
+    for warning in warnings:
+        click.secho(warning, fg="yellow", bold=True, err=True)
+
+    is_active = int(active) if active is not None else None
     if DBService.update_coser(name, weibo, bili, xhs, is_active):
         click.secho(f"✓ 成功更新 Coser [{name}] 的配置！", fg="green", bold=True)
     else:

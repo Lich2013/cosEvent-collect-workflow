@@ -2501,4 +2501,66 @@ def test_date_inference_inheritance_view_and_export(tmp_path):
     conn.close()
 
 
+def test_coser_duplicate_warnings():
+    """测试新增和更新 Coser 时的名字相似度及平台 UID 占用冲突校验警告（非阻断且安全输出到 stderr）"""
+    from click.testing import CliRunner
+    from src.main import cli
+    from src.services.db.coser_repository import CoserRepository
+    
+    runner = CliRunner()
+
+    # 1. 注册基础 Coser，此时是干净的数据库，无警告
+    result = runner.invoke(cli, ["coser", "add", "--name", "桃景三酪", "--bili", "11286045"])
+    assert result.exit_code == 0
+    assert "✓ 成功注册 Coser [桃景三酪]" in result.stdout
+    assert "名字相似度碰撞" not in result.stderr
+    assert "平台 UID 冲突检测" not in result.stderr
+
+    # 2. 注册疑似冲突的 Coser "桃景三酪_"，且 bilibili_uid 设为 " 11286045 " (带空格，测试边界清洗)
+    result = runner.invoke(cli, ["coser", "add", "--name", "桃景三酪_", "--bili", " 11286045 "])
+    assert result.exit_code == 0
+    
+    # 验证名字相似度碰撞警告与 B站 UID 被 "桃景三酪" 占用的冲突警告都在 stderr 中，且 stdout 为成功消息
+    assert "名字相似度碰撞" in result.stderr
+    assert "桃景三酪_" in result.stderr
+    assert "桃景三酪" in result.stderr
+    assert "平台 UID 冲突检测" in result.stderr
+    assert "bilibili_uid '11286045' 已被 Coser [桃景三酪] 绑定" in result.stderr
+    assert "✓ 成功注册 Coser [桃景三酪_]" in result.stdout
+
+    # 3. 尝试更新 Coser，以整数传入 UID，触发平台 UID 冲突警告并路由至 stderr
+    # 首先添加另一个 coser "微博博主"（weibo_uid="999"）
+    result = runner.invoke(cli, ["coser", "add", "--name", "微博博主", "--weibo", "999"])
+    assert result.exit_code == 0
+    
+    # 更新 "桃景三酪_"，将其 weibo_uid 设为 999 (类型兼容性测试)
+    result = runner.invoke(cli, ["coser", "update", "--name", "桃景三酪_", "--weibo", "999"])
+    assert result.exit_code == 0
+    assert "平台 UID 冲突检测" in result.stderr
+    assert "weibo_uid '999' 已被 Coser [微博博主] 绑定" in result.stderr
+    assert "✓ 成功更新 Coser [桃景三酪_] 的配置！" in result.stdout
+    
+    # 4. 更新自身 UID 时，不应该触发自己的冲突警告，且此时不应做名字相似度校验 (即使名字与桃景三酪相似)
+    # 先把 桃景三酪_ 的 weibo_uid 清空，避免产生别的冲突干扰
+    result = runner.invoke(cli, ["coser", "update", "--name", "桃景三酪_", "--weibo", ""])
+    assert result.exit_code == 0
+    
+    # 更新 "微博博主"
+    result = runner.invoke(cli, ["coser", "update", "--name", "微博博主", "--weibo", "999"])
+    assert result.exit_code == 0
+    assert "平台 UID 冲突检测" not in result.stderr
+    assert "名字相似度碰撞" not in result.stderr
+
+    # 5. 直接通过 Repository 接口测试类型兼容性与空格清洗
+    warnings = CoserRepository.check_coser_duplicates(
+        name="测试冲突者",
+        bilibili_uid=11286045, # 传入 int 并且存在冲突
+        check_name_similarity=False
+    )
+    assert len(warnings) == 2
+    assert any("已被 Coser [桃景三酪] 绑定" in w for w in warnings)
+    assert any("已被 Coser [桃景三酪_] 绑定" in w for w in warnings)
+
+
+
 

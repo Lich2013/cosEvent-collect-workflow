@@ -364,52 +364,69 @@ def test_materialized_view_rebuild():
     cursor.execute("INSERT INTO raw_posts (coser_id, platform, post_id, content, published_at, is_analyzed) VALUES (?, 'weibo', 'p_cold_post', 'content', ?, 1);", (coser_id, old_date))
     cold_post_id = cursor.lastrowid
     
-    # 3. 直接在 cosplay_events 写入原始只读日程事实数据
-    # 3.1 热日程 1 和 2: 名字相同，日期相同，应合并为同一个活跃超级展示节点
+    # 3. 直接在 cosplay_events 写入原始只读日程事实数据并关联归一化超级漫展ID
+    # 3.1 预先生成归一化事件节点
+    ne_id_nikke = EventFusionService.find_or_create_normalized_event(
+        cursor, "Nikke罗森一日店长", "上海", active_date, "一日店长"
+    )
+    ne_id_generic = EventFusionService.find_or_create_normalized_event(
+        cursor, "一日店长", "上海", active_date, "一日店长"
+    )
+    ne_id_old = EventFusionService.find_or_create_normalized_event(
+        cursor, "次元之门漫展", "上海", old_date, "漫展"
+    )
+    ne_id_unknown_old = EventFusionService.find_or_create_normalized_event(
+        cursor, "古老未知日程", "上海", "未知", "一日店长"
+    )
+    ne_id_bw = EventFusionService.find_or_create_normalized_event(
+        cursor, "Bilibili World 2026", "上海", "2026-07-10", "漫展"
+    )
+
+    # 3.2 热日程 1 和 2: 名字相同，日期相同，且指向相同 normalized_event_id，应合并为同一个活跃超级展示节点
     cursor.execute(
-        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status) VALUES (?, '物化测试Coser', 'Nikke罗森一日店长', ?, '上海罗森', '一日店长', '未开始');",
-        (hot_post_id, active_date)
+        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status, normalized_event_id) VALUES (?, '物化测试Coser', 'Nikke罗森一日店长', ?, '上海罗森', '一日店长', '未开始', ?);",
+        (hot_post_id, active_date, ne_id_nikke)
     )
     raw_ev_1 = cursor.lastrowid
     
     cursor.execute(
-        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status) VALUES (?, '物化测试Coser', 'Nikke罗森一日店长', ?, '上海罗森', '一日店长', '未开始');",
-        (hot_post_id, active_date)
+        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status, normalized_event_id) VALUES (?, '物化测试Coser', 'Nikke罗森一日店长', ?, '上海罗森', '一日店长', '未开始', ?);",
+        (hot_post_id, active_date, ne_id_nikke)
     )
     raw_ev_2 = cursor.lastrowid
     
-    # 3.2 热日程 3: 极简泛称名字在黑名单中，应触发 Gated 旁路生成独立超级节点
+    # 3.3 热日程 3: 极简泛称名字在黑名单中，由 Fusion Engine 旁路生成独立超级节点
     cursor.execute(
-        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status) VALUES (?, '物化测试Coser', '一日店长', ?, '上海罗森', '一日店长', '未开始');",
-        (hot_post_id, active_date)
+        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status, normalized_event_id) VALUES (?, '物化测试Coser', '一日店长', ?, '上海罗森', '一日店长', '未开始', ?);",
+        (hot_post_id, active_date, ne_id_generic)
     )
     raw_ev_3 = cursor.lastrowid
     
-    # 3.3 冷日程 4: 日期早于 30 天之前，应生成为冻结节点 (is_frozen = 1)
+    # 3.4 冷日程 4: 日期早于 30 天之前，应生成为冻结节点 (is_frozen = 1)
     cursor.execute(
-        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status) VALUES (?, '物化测试Coser', '次元之门漫展', ?, '上海', '漫展', '未开始');",
-        (hot_post_id, old_date)
+        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status, normalized_event_id) VALUES (?, '物化测试Coser', '次元之门漫展', ?, '上海', '漫展', '未开始', ?);",
+        (hot_post_id, old_date, ne_id_old)
     )
     raw_ev_4 = cursor.lastrowid
     
-    # 3.4 冷日程 5: 未知日期但原始博文发布于 50 天前，应触发未知冷冻生成冻结节点 (is_frozen = 1)
+    # 3.5 冷日程 5: 未知日期但原始博文发布于 50 天前，应触发未知冷冻生成冻结节点 (is_frozen = 1)
     cursor.execute(
-        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status) VALUES (?, '物化测试Coser', '古老未知日程', '未知', '上海', '一日店长', '未开始');",
-        (cold_post_id,)
+        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status, normalized_event_id) VALUES (?, '物化测试Coser', '古老未知日程', '未知', '上海', '一日店长', '未开始', ?);",
+        (cold_post_id, ne_id_unknown_old)
     )
     raw_ev_5 = cursor.lastrowid
 
-    # 3.5 空间自适应纠偏测试日程：
-    # 一个具体城市的上海 BW 活跃日程，和一个未知城市的 BW 活跃日程。它们应被智能纠宿融合，统合为“上海”的同一个展示超级节点。
+    # 3.6 空间自适应纠偏与融合：
+    # 两个 BW 活跃日程，都在 Fusion Engine 中判定并指向同一个 normalized_event_id。它们在物化层合并为同一个展示超级节点。
     cursor.execute(
-        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status) VALUES (?, '物化测试Coser', 'Bilibili World 2026', '2026-07-10', '上海国家会展中心', '漫展', '未开始');",
-        (hot_post_id,)
+        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status, normalized_event_id) VALUES (?, '物化测试Coser', 'Bilibili World 2026', '2026-07-10', '上海国家会展中心', '漫展', '未开始', ?);",
+        (hot_post_id, ne_id_bw)
     )
     raw_ev_bw_concrete = cursor.lastrowid
 
     cursor.execute(
-        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status) VALUES (?, '物化测试Coser', 'Bilibili World 2026', '2026-07-11', '未知', '漫展', '未开始');",
-        (hot_post_id,)
+        "INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_type, status, normalized_event_id) VALUES (?, '物化测试Coser', 'Bilibili World 2026', '2026-07-11', '未知', '漫展', '未开始', ?);",
+        (hot_post_id, ne_id_bw)
     )
     raw_ev_bw_unknown = cursor.lastrowid
     

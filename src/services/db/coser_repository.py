@@ -1,11 +1,96 @@
 import sqlite3
 import datetime
 from src.models.db_models import get_db_connection
+from src.utils.logger import log_event
 
 class CoserRepository:
     @staticmethod
+    def check_coser_duplicates(
+        name: str, 
+        weibo_uid: str = None, 
+        bilibili_uid: str = None, 
+        xhs_uid: str = None, 
+        exclude_name: str = None, 
+        check_name_similarity: bool = True
+    ) -> list[str]:
+        """检查 Coser 名字相似度与平台 UID 占用冲突，返回警告信息列表"""
+        import re
+        import difflib
+
+        warnings = []
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # 1. 名字相似度校验（仅在启用姓名检查且 name 不为空时）
+            if check_name_similarity and name:
+                cursor.execute("SELECT name FROM cosers")
+                exist_names = [row[0] for row in cursor.fetchall()]
+
+                def clean_name(s: str) -> str:
+                    if not s:
+                        return ""
+                    return re.sub(r"[\s\-\_\,\.\!\?\#\&\*\/]", "", s).lower()
+
+                cleaned_input = clean_name(name)
+                for exist_name in exist_names:
+                    if exclude_name and exist_name == exclude_name:
+                        continue
+                        
+                    cleaned_exist = clean_name(exist_name)
+                    is_similar = False
+                    
+                    # (1) 归一化比对
+                    if cleaned_input == cleaned_exist:
+                        is_similar = True
+                    # (2) 子串包含判定（较短方长度 >= 2）
+                    elif cleaned_input and cleaned_exist:
+                        shorter_len = min(len(cleaned_input), len(cleaned_exist))
+                        if shorter_len >= 2:
+                            if cleaned_input in cleaned_exist or cleaned_exist in cleaned_input:
+                                is_similar = True
+                    
+                    # (3) difflib 相似度比对
+                    if not is_similar and cleaned_input and cleaned_exist:
+                        ratio = difflib.SequenceMatcher(None, cleaned_input, cleaned_exist).ratio()
+                        if ratio >= 0.7:
+                            is_similar = True
+                            
+                    if is_similar:
+                        warnings.append(f"⚠️ [警告] 名字相似度碰撞：新指定的 Coser 姓名 '{name}' 与已存在的 Coser '{exist_name}' 相似！")
+
+            # 2. 多平台 UID 占用冲突校验（在 SQL 层 O(1) 进行匹配）
+            uids_to_check = {
+                "weibo": weibo_uid,
+                "bilibili": bilibili_uid,
+                "xhs": xhs_uid
+            }
+            
+            for platform, uid in uids_to_check.items():
+                if uid is None:
+                    continue
+                uid_str = str(uid).strip()
+                if not uid_str or uid_str in ("", "-"):
+                    continue
+                
+                sql = f"SELECT name FROM cosers WHERE TRIM({platform}_uid) = ? AND name != ?"
+                cursor.execute(sql, (uid_str, exclude_name or ""))
+                rows = cursor.fetchall()
+                for row in rows:
+                    warnings.append(f"⚠️ [警告] 平台 UID 冲突检测：新指定的 {platform}_uid '{uid_str}' 已被 Coser [{row[0]}] 绑定！")
+                    
+            return warnings
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
     def add_coser(name: str, weibo_uid: str = None, bilibili_uid: str = None, xhs_uid: str = None) -> bool:
         """新增 Coser"""
+        # 前置校验名字相似度与平台 UID 占用冲突，并将警报写入日志
+        warnings = CoserRepository.check_coser_duplicates(name, weibo_uid, bilibili_uid, xhs_uid, check_name_similarity=True)
+        for warning in warnings:
+            log_event("WARNING", "CoserRepository", warning)
+
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -83,6 +168,11 @@ class CoserRepository:
     @staticmethod
     def update_coser(name: str, weibo_uid: str = None, bilibili_uid: str = None, xhs_uid: str = None, is_active: int = None) -> bool:
         """更新 Coser 属性或启用状态"""
+        # 前置校验平台 UID 占用冲突（排除当前 Coser 自己，且不校验名字相似度）
+        warnings = CoserRepository.check_coser_duplicates(name, weibo_uid, bilibili_uid, xhs_uid, exclude_name=name, check_name_similarity=False)
+        for warning in warnings:
+            log_event("WARNING", "CoserRepository", warning)
+
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
