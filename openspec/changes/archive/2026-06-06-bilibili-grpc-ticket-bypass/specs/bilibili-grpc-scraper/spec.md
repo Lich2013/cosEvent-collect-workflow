@@ -1,8 +1,5 @@
-# bilibili-grpc-scraper Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change integrate-bilibili-grpc-dynamic-updater. Update Purpose after archive.
-## Requirements
 ### Requirement: B站 gRPC 凭证配置与初始化读取
 系统必须且 SHALL 从配置文件 `config/settings.yaml` 或系统环境变量（支持 `.env` 文件覆盖）中读取 B 站 gRPC 抓取所必需的移动端凭证（`bilibili_grpc_access_token` 和 `bilibili_grpc_mid`），以及缓存的 `bilibili_grpc_ticket` 及其秒级过期时间戳 `bilibili_grpc_ticket_expires_at`。
 在 scraper 实例化或初始化时，系统必须检查鉴权配置项是否存在且非空。若均有效，则置为 gRPC 优先模式；若缺失，则自动标记为网页降级模式。

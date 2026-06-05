@@ -179,3 +179,28 @@ class TerminalRenderer:
         click.echo("=" * 75)
         click.echo(tabulate(table_data, headers=headers, tablefmt="grid"))
         click.echo("")
+
+    @staticmethod
+    def render_candidates_table(candidates: list[dict]):
+        """渲染新发现的 Coser 候选列表"""
+        if not candidates:
+            click.echo("当前没有候选记录。")
+            return
+            
+        table_data = []
+        for c in candidates:
+            score_val = c.get("match_score")
+            score_str = f"{score_val:.1f}" if (score_val is not None and isinstance(score_val, (int, float))) else "-"
+            table_data.append([
+                c["id"],
+                c["name"],
+                c["platform"],
+                c["matched_bili_uid"] or "-",
+                score_str,
+                c["status"],
+                c["source_ref"] or "-",
+                c["created_at"]
+            ])
+            
+        headers = ["ID", "Coser 昵称", "发现平台", "匹配 B站 UID", "匹配分", "状态", "来源链接", "发现时间"]
+        click.echo(tabulate(table_data, headers=headers, tablefmt="grid"))

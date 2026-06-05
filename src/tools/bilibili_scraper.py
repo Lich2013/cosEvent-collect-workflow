@@ -133,6 +133,7 @@ APP_CREDENTIALS = {
 class BilibiliScraper(BaseScraper):
     def __init__(self):
         super().__init__("bilibili")
+        self._ticket_lock = asyncio.Lock()
 
     @staticmethod
     def _parse_bili_ptime(ptime_str: str) -> tuple[bool, str]:
@@ -341,6 +342,8 @@ class BilibiliScraper(BaseScraper):
         
         ua_val = f'Dalvik/2.1.0 (Linux; U; Android 12; {model_val} Build/SKQ1.211006.001) {version_name_val} os/android model/{model_val} mobi_app/{mobi_app_val} build/{build_val} channel/master innerVer/{build_val} grpc-java-cronet/1.36.1'
         
+        ticket = await self._get_valid_bili_ticket()
+        
         metadata = [
             ('user-agent', ua_val),
             ('x-bili-mid', str(mid_val)),
@@ -355,34 +358,87 @@ class BilibiliScraper(BaseScraper):
             ('x-bili-locale-bin', loc.SerializeToString()),
             ('x-bili-fawkes-req-bin', fawk.SerializeToString())
         ]
+        if ticket:
+            metadata.append(('x-bili-ticket', ticket))
         
         host = "grpc.biliapi.net:443"
         credentials = grpc.ssl_channel_credentials()
         
-        def _call_grpc():
+        # 1. 获取动态列表 (with retry on -352)
+        def _call_space():
             with grpc.secure_channel(host, credentials) as channel:
                 stub = v2_pb2_grpc.DynamicStub(channel)
-                # 1. 获取动态列表
-                space_resp = stub.DynSpace(req, metadata=metadata, timeout=10)
+                return stub.DynSpace(req, metadata=metadata, timeout=10)
                 
-                # 2. 复用 stub 精准调取每个有效动态的 DynDetail 以获取高精度的最近编辑时间 (例如 '编辑于 2026年5月28日 12:01')
-                details = {}
-                for item in space_resp.list[:limit]:
-                    post_id = str(item.extend.dyn_id_str)
-                    if post_id and post_id != "0":
-                        try:
-                            detail_req = v2_pb2.DynDetailReq()
-                            detail_req.uid = mid_val
-                            detail_req.dynamic_id = post_id
-                            setattr(detail_req, "from", "login")
+        try:
+            response = await asyncio.to_thread(_call_space)
+        except Exception as space_err:
+            if self._is_bili_grpc_risk_error(space_err):
+                print(f"\x1b[1;33m[Scraper Warning] DynSpace 触发 -352 风控拦截，尝试刷新 Ticket 后重试...\x1b[0m")
+                new_ticket = await self._get_valid_bili_ticket(force_refresh=True)
+                metadata = [t for t in metadata if t[0] != 'x-bili-ticket']
+                if new_ticket:
+                    metadata.append(('x-bili-ticket', new_ticket))
+                
+                def _call_space_retry():
+                    with grpc.secure_channel(host, credentials) as channel:
+                        stub = v2_pb2_grpc.DynamicStub(channel)
+                        return stub.DynSpace(req, metadata=metadata, timeout=10)
+                try:
+                    response = await asyncio.to_thread(_call_space_retry)
+                except Exception as retry_err:
+                    print(f"\x1b[1;31m[Scraper Error] DynSpace 重试依旧遭到 -352 风控拦截: {retry_err}\x1b[0m")
+                    raise retry_err
+            else:
+                raise space_err
+
+        # 2. 复用 stub 精准调取每个有效动态的 DynDetail 以获取高精度的最近编辑时间
+        details_map = {}
+        for item in response.list[:limit]:
+            post_id = str(item.extend.dyn_id_str)
+            if post_id and post_id != "0":
+                async def _get_detail_with_retry(pid, metadata_list):
+                    detail_req = v2_pb2.DynDetailReq()
+                    detail_req.uid = mid_val
+                    detail_req.dynamic_id = pid
+                    setattr(detail_req, "from", "login")
+                    
+                    def _call_detail():
+                        with grpc.secure_channel(host, credentials) as channel:
+                            stub = v2_pb2_grpc.DynamicStub(channel)
+                            return stub.DynDetail(detail_req, metadata=metadata_list, timeout=5)
                             
-                            detail_resp = stub.DynDetail(detail_req, metadata=metadata, timeout=5)
-                            details[post_id] = detail_resp
-                        except Exception as detail_err:
-                            print(f"\x1b[1;33m[Scraper Warning] 获取动态 {post_id} 的 DynDetail 失败: {detail_err}\x1b[0m")
-                return space_resp, details
-                
-        response, details_map = await asyncio.to_thread(_call_grpc)
+                    try:
+                        return await asyncio.to_thread(_call_detail)
+                    except Exception as err:
+                        if self._is_bili_grpc_risk_error(err):
+                            print(f"\x1b[1;33m[Scraper Warning] DynDetail 获取 {pid} 触发 -352 风控，尝试刷新 Ticket 后重试...\x1b[0m")
+                            new_t = await self._get_valid_bili_ticket(force_refresh=True)
+                            new_m = [t for t in metadata_list if t[0] != 'x-bili-ticket']
+                            if new_t:
+                                new_m.append(('x-bili-ticket', new_t))
+                            
+                            # 更新外部 metadata 供后续的详情请求直接使用新 Ticket
+                            nonlocal metadata
+                            metadata = new_m
+                            
+                            def _call_detail_retry():
+                                with grpc.secure_channel(host, credentials) as channel:
+                                    stub = v2_pb2_grpc.DynamicStub(channel)
+                                    return stub.DynDetail(detail_req, metadata=new_m, timeout=5)
+                            try:
+                                return await asyncio.to_thread(_call_detail_retry)
+                            except Exception as retry_err:
+                                print(f"\x1b[1;31m[Scraper Error] DynDetail 重试获取 {pid} 依然失败: {retry_err}\x1b[0m")
+                                raise retry_err
+                        else:
+                            raise err
+                            
+                try:
+                    detail_resp = await _get_detail_with_retry(post_id, metadata)
+                    details_map[post_id] = detail_resp
+                except Exception as detail_err:
+                    print(f"\x1b[1;33m[Scraper Warning] 获取动态 {post_id} 的 DynDetail 最终失败: {detail_err}\x1b[0m")
         
         posts = []
         for item in response.list[:limit]:
@@ -469,10 +525,19 @@ class BilibiliScraper(BaseScraper):
         return posts
 
     async def fetch_bilibili_posts_grpc(self, uid: str, limit: int = None) -> list[dict]:
-        """通过 B 站第一方移动端 gRPC 接口抓取空间动态（支持自愈式 Token 自动刷新与重试）"""
+        """通过 B 站第一方移动端 gRPC 接口抓取空间动态（支持自愈式 Token/Ticket 自动刷新与重试）"""
         try:
             return await self._fetch_bilibili_posts_grpc_internal(uid, limit)
         except Exception as e:
+            # 1. 如果是 -352 风控，且可能本地 Ticket 已失效，尝试刷新 Ticket 后重试
+            if self._is_bili_grpc_risk_error(e):
+                print(f"\x1b[1;33m[Scraper Warning] 检测到 B站 gRPC -352 风控拦截: {e}，正在尝试刷新 Ticket 自愈...\x1b[0m")
+                ticket = await self._get_valid_bili_ticket(force_refresh=True)
+                if ticket:
+                    print("\x1b[1;32m[Scraper] B站 Ticket 自动更新成功，正在重试 gRPC 抓取...\x1b[0m")
+                    return await self._fetch_bilibili_posts_grpc_internal(uid, limit)
+            
+            # 2. 如果是 -101 等鉴权失效，且有 refresh_token，尝试刷新 token 后重试
             refresh_token = getattr(settings, "bilibili_grpc_refresh_token", "")
             if self._is_bili_grpc_auth_error(e) and refresh_token:
                 print(f"\x1b[1;33m[Scraper Warning] 检测到 B站 gRPC 凭证失效/过期: {e}，正在尝试使用 refresh_token 自愈刷新...\x1b[0m")
@@ -481,6 +546,13 @@ class BilibiliScraper(BaseScraper):
                     print("\x1b[1;32m[Scraper] B站 Token 自动置换成功，正在重试 gRPC 抓取...\x1b[0m")
                     return await self._fetch_bilibili_posts_grpc_internal(uid, limit)
             raise e
+
+    def _is_bili_grpc_risk_error(self, e: Exception) -> bool:
+        """判定异常是否为 B站 gRPC -352 风控拦截"""
+        err_str = str(e).lower()
+        if "-352" in err_str:
+            return True
+        return False
 
     def _is_bili_grpc_auth_error(self, e: Exception) -> bool:
         """精准判定异常是否为 B站 gRPC 鉴权失败或 Token 过期"""
@@ -603,6 +675,131 @@ class BilibiliScraper(BaseScraper):
             print("\x1b[1;32m[Scraper] 成功将最新凭据持久化写入至项目 .env 文件！\x1b[0m")
         except Exception as e:
             print(f"\x1b[1;31m[Scraper Error] 持久化更新 .env 配置文件失败: {e}\x1b[0m")
+
+    async def _get_valid_bili_ticket(self, force_refresh: bool = False) -> str:
+        """获取有效的 B站 ticket，如果过期或者强制刷新则重新获取并缓存"""
+        ticket = getattr(settings, "bilibili_grpc_ticket", "")
+        expires_at = getattr(settings, "bilibili_grpc_ticket_expires_at", 0)
+        
+        now = int(time.time())
+        # 留出 10 分钟 (600 秒) 的缓冲余量
+        if not force_refresh and ticket and (expires_at - now > 600):
+            return ticket
+            
+        async with self._ticket_lock:
+            # 双重检查锁：在锁定后，重新获取当前的缓存状态
+            ticket = getattr(settings, "bilibili_grpc_ticket", "")
+            expires_at = getattr(settings, "bilibili_grpc_ticket_expires_at", 0)
+            now = int(time.time())
+            
+            # 如果不是强制刷新，且当前有有效的 ticket（留有 10 分钟缓冲），直接复用
+            if not force_refresh and ticket and (expires_at - now > 600):
+                return ticket
+                
+            # 如果是强制刷新（如发生 -352 报错），但有另一个协程在极近期（如 15 秒内）刚刚更新过，则无需二次网络调用，直接复用
+            if force_refresh and ticket and (expires_at - now > 259200 - 15):
+                return ticket
+                
+            print(f"\x1b[1;32m[Scraper] B站 ticket 不存在、已过期或触发强制刷新，正在申请新 ticket...\x1b[0m")
+            try:
+                import hmac
+                import hashlib
+                import urllib.request
+                import urllib.parse
+                import json
+                
+                def hmac_sha256(key, message):
+                    key = key.encode('utf-8')
+                    message = message.encode('utf-8')
+                    return hmac.new(key, message, hashlib.sha256).digest().hex()
+                    
+                ts = int(time.time())
+                hexsign = hmac_sha256("XgwSnGZ1p", f"ts{ts}")
+                url = "https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket"
+                params = {
+                    "key_id": "ec02",
+                    "hexsign": hexsign,
+                    "context[ts]": str(ts),
+                    "csrf": ""
+                }
+                
+                # 修复 POST 参：以标准的 application/x-www-form-urlencoded 体形式发送
+                data = urllib.parse.urlencode(params).encode("utf-8")
+                
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    method="POST",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Content-Type": "application/x-www-form-urlencoded"
+                    }
+                )
+                
+                def _post_ticket():
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                        
+                res_json = await asyncio.to_thread(_post_ticket)
+                
+                if res_json.get("code") != 0:
+                    print(f"\x1b[1;31m[Scraper Error] 申请 ticket 失败: {res_json.get('message')} (code: {res_json.get('code')})\x1b[0m")
+                    return ""
+                    
+                data = res_json.get("data", {})
+                new_ticket = data.get("ticket", "")
+                ttl = data.get("ttl", 259200)
+                new_expires_at = int(time.time()) + ttl
+                
+                if new_ticket:
+                    print(f"\x1b[1;32m[Scraper] B站 ticket 申请成功！有效期 {ttl} 秒。\x1b[0m")
+                    settings.bilibili_grpc_ticket = new_ticket
+                    settings.bilibili_grpc_ticket_expires_at = new_expires_at
+                    self._update_dotenv_ticket(new_ticket, new_expires_at)
+                    return new_ticket
+                    
+            except Exception as e:
+                print(f"\x1b[1;31m[Scraper Error] 申请 B站 ticket 发生异常: {e}\x1b[0m")
+                
+            return ""
+
+    def _update_dotenv_ticket(self, ticket: str, expires_at: int):
+        """将新获取的 B站 ticket 及其过期时间物理更新写入项目根目录下的 .env 文件中"""
+        try:
+            from pathlib import Path
+            project_root = Path(__file__).resolve().parent.parent.parent
+            dotenv_path = project_root / ".env"
+            
+            if not dotenv_path.exists():
+                print(f"\x1b[1;33m[Scraper Warning] 未找到 .env 配置文件，无法执行 Ticket 持久化写入 (路径: {dotenv_path})\x1b[0m")
+                return
+                
+            content = dotenv_path.read_text(encoding="utf-8")
+            
+            if "BILIBILI_TICKET" in content:
+                content = re.sub(
+                    r"^BILIBILI_TICKET\s*=.*$",
+                    f"BILIBILI_TICKET={ticket}",
+                    content,
+                    flags=re.MULTILINE
+                )
+            else:
+                content += f"\nBILIBILI_TICKET={ticket}"
+                
+            if "BILIBILI_TICKET_EXPIRES_AT" in content:
+                content = re.sub(
+                    r"^BILIBILI_TICKET_EXPIRES_AT\s*=.*$",
+                    f"BILIBILI_TICKET_EXPIRES_AT={expires_at}",
+                    content,
+                    flags=re.MULTILINE
+                )
+            else:
+                content += f"\nBILIBILI_TICKET_EXPIRES_AT={expires_at}"
+                
+            dotenv_path.write_text(content, encoding="utf-8")
+            print("\x1b[1;32m[Scraper] 成功将最新 Ticket 及其过期时间持久化写入至项目 .env 文件！\x1b[0m")
+        except Exception as e:
+            print(f"\x1b[1;31m[Scraper Error] 持久化更新 .env Ticket 失败: {e}\x1b[0m")
 
     async def fetch_bilibili_posts(self, uid: str, limit: int = None) -> list[dict]:
         """抓取指定用户的B站动态列表"""
@@ -920,7 +1117,7 @@ class BilibiliScraper(BaseScraper):
                     
                 if i > 0:
                     delay = random.uniform(1.5, 3.0)
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
                     
                 candidates = []
                 target_url = f"https://search.bilibili.com/upuser?keyword={kw}"
@@ -1067,4 +1264,7 @@ class BilibiliScraper(BaseScraper):
             await page.close()
             return results_map
 
-        return await self.scrape_flow_handler(_search_batch, keywords)
+        res = await self.scrape_flow_handler(_search_batch, keywords)
+        if isinstance(res, list):
+            return {}
+        return res

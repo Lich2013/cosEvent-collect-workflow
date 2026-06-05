@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import pytest
 import datetime
+import time
 from unittest.mock import patch, MagicMock
 import grpc
 from src.tools.bilibili_scraper import BilibiliScraper
@@ -85,3 +86,53 @@ async def test_fetch_bilibili_posts_fallback_on_grpc_error():
             mock_playwright.assert_called_once()
             assert len(posts) == 1
             assert posts[0]["post_id"] == "playwright_1"
+
+
+@pytest.mark.asyncio
+async def test_bili_ticket_generation():
+    # 测试 B站 Ticket 的成功获取和缓存更新
+    scraper = BilibiliScraper()
+    mock_response = MagicMock()
+    mock_response.read.return_value = b'{"code":0,"message":"OK","data":{"ticket":"mocked_ticket_123","ttl":259200}}'
+    mock_response.__enter__.return_value = mock_response
+    
+    with patch("urllib.request.urlopen", return_value=mock_response), \
+         patch.object(scraper, "_update_dotenv_ticket") as mock_update_dotenv:
+        ticket = await scraper._get_valid_bili_ticket(force_refresh=True)
+        assert ticket == "mocked_ticket_123"
+        assert settings.bilibili_grpc_ticket == "mocked_ticket_123"
+        mock_update_dotenv.assert_called_once_with("mocked_ticket_123", pytest.approx(int(time.time()) + 259200, abs=10))
+
+
+@pytest.mark.asyncio
+async def test_bili_grpc_risk_error_retry_flow():
+    # 测试 gRPC 风控错误 (-352) 触发 Ticket 刷新并重试的自愈流程
+    scraper = BilibiliScraper()
+    
+    # 模拟 _is_bili_grpc_risk_error 正常工作
+    assert scraper._is_bili_grpc_risk_error(Exception("status = StatusCode.UNKNOWN, details = \"-352\"")) is True
+    assert scraper._is_bili_grpc_risk_error(Exception("another error")) is False
+    
+    # 验证 fetch_bilibili_posts_grpc 遇到 -352 会尝试重试
+    call_count = 0
+    async def mock_internal_fail_once(uid, limit):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # 模拟第一次失败，抛出包含 -352 的异常
+            raise Exception("Mocked gRPC -352 risk block")
+        # 第二次重试成功返回数据
+        return [{"post_id": "grpc_retry_success", "content": "hello"}]
+        
+    with patch.object(scraper, "_fetch_bilibili_posts_grpc_internal", side_effect=mock_internal_fail_once) as mock_internal, \
+         patch.object(scraper, "_get_valid_bili_ticket", return_value="new_mocked_ticket") as mock_get_ticket:
+         
+        posts = await scraper.fetch_bilibili_posts_grpc("123456", limit=3)
+        assert len(posts) == 1
+        assert posts[0]["post_id"] == "grpc_retry_success"
+        
+        # 验证内部方法被调用了 2 次 (1次原始，1次重试)
+        assert mock_internal.call_count == 2
+        # 验证因为 -352 风控，触发了 _get_valid_bili_ticket(force_refresh=True) 强制刷新
+        mock_get_ticket.assert_called_once_with(force_refresh=True)
+

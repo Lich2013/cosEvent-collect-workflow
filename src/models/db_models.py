@@ -1,14 +1,20 @@
 import sqlite3
 from src.config import settings
+from src.utils.backup_helper import auto_backup_db
 
 def get_db_connection():
-    """获取本地 SQLite 数据库连接，并启用外键约束支撑"""
+    """获取本地 SQLite 数据库连接，并启用外键约束及 WAL 模式支撑"""
     conn = sqlite3.connect(settings.db_path)
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
     return conn
+
 
 def init_db():
     """根据设计规范使用原生 SQL 初始化三张核心数据库表及索引"""
+    # 自动在结构初始化或升级前备份数据库
+    auto_backup_db()
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -121,6 +127,35 @@ def init_db():
             CHECK (event_type IN ('漫展', '一日店长', '摄影会', '受邀模特', '快闪/签售'))
         );
         """)
+        
+        # 5.7 创建 coser_candidates 表 (新发现的 Coser 候选表)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS coser_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            platform TEXT NOT NULL,
+            source_ref TEXT,
+            matched_bili_uid TEXT,
+            matched_weibo_uid TEXT,
+            matched_xhs_uid TEXT,
+            match_score REAL DEFAULT 0.0,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
+            CHECK (status IN ('pending', 'approved', 'ignored'))
+        );
+        """)
+        
+        # 5.8 创建 coser_scrape_state 表 (独立平台调度状态表)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS coser_scrape_state (
+            coser_id INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            last_scraped_at TEXT,
+            PRIMARY KEY (coser_id, platform),
+            FOREIGN KEY(coser_id) REFERENCES cosers(id) ON DELETE CASCADE
+        );
+        """)
+
         
         # 6. 自动数据库热升级：检测并追加新列以支持微博编辑次数与发表时间控制
         cursor.execute("PRAGMA table_info(raw_posts);")

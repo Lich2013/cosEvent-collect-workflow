@@ -6,6 +6,7 @@ from src.tools.weibo_scraper import WeiboScraper
 from src.tools.bilibili_scraper import BilibiliScraper
 from src.tools.xhs_scraper import XhsScraper
 from src.utils.logger import log_event
+from src.models.db_models import get_db_connection
 
 class WorkflowOrchestrator:
     """
@@ -14,81 +15,145 @@ class WorkflowOrchestrator:
     """
 
     @staticmethod
-    async def run_scrape(limit: int = None, coser_name: str = None, platform: str = "all") -> tuple[int, dict, int]:
+    async def run_scrape(limit: int = None, coser_name: str = None, platform: str = "all", batch_size: int = None) -> tuple[int, dict, int]:
         """[Scrape Phase] 异步去重抓取活跃 Coser 博文动态并持久化
 
         Args:
-            limit: 单一平台最大爬取条数。
-            coser_name: 可选，仅抓取匹配该姓名/昵称的 Coser；None 表示全量。
-            platform: 可选，仅抓取该平台（weibo/bilibili/xhs/all）；默认 all 全量。
+            limit: 单一平台单次爬取动态条数。
+            coser_name: 可选，仅抓取该 Coser；None 表示按时间窗口调度。
+            platform: 可选，抓取平台（weibo/bilibili/xhs/all）。
+            batch_size: 每次调度最大 Coser 数量限制。
         """
-        cosers = DBService.list_cosers(only_active=True)
-
-        # 姓名过滤：内存推导裁剪，空结果优雅熔断
-        if coser_name:
-            cosers = [c for c in cosers if c["name"] == coser_name]
-            if not cosers:
-                print(f"\x1b[1;33m[WARNING] 未找到处于激活状态且名为 [{coser_name}] 的 Coser，请确认姓名拼写或启用状态。\x1b[0m")
-                return 0, {}, 0
-
-        if not cosers:
-            return 0, {
-                "weibo": {"success": 0, "total": 0},
-                "bilibili": {"success": 0, "total": 0},
-                "xhs": {"success": 0, "total": 0}
-            }, 0
+        # 默认 batch_size 为 30
+        batch_limit = batch_size if batch_size is not None else 30
 
         # 仅实例化被指定平台的 Scraper，避免其余平台的冷启动
         weibo_sc = WeiboScraper() if platform in ("weibo", "all") else None
         bili_sc = BilibiliScraper() if platform in ("bilibili", "all") else None
         xhs_sc = XhsScraper() if platform in ("xhs", "all") else None
 
-        total_cosers = len(cosers)
         success_platforms = {
             "weibo": {"success": 0, "total": 0},
             "bilibili": {"success": 0, "total": 0},
             "xhs": {"success": 0, "total": 0}
         }
         total_inserted = 0
+        processed_coser_ids = set()
 
-        for c in cosers:
-            # 微博抓取
-            if c["weibo_uid"] and platform in ("weibo", "all"):
-                success_platforms["weibo"]["total"] += 1
-                try:
-                    posts = await weibo_sc.fetch_weibo_posts(c["weibo_uid"], limit)
-                    if posts:
-                        ins = DBService.save_raw_posts(c["id"], "weibo", posts)
-                        total_inserted += ins
-                    success_platforms["weibo"]["success"] += 1
-                except Exception as e:
-                    log_event("ERROR", "scraper_weibo", f"Coser [{c['name']}] 微博抓取失败: {e}", str(e))
+        db_conn = get_db_connection()
+        try:
+            single_coser_list = []
+            if coser_name:
+                all_cosers = DBService.list_cosers(only_active=True, conn=db_conn)
+                single_coser_list = [c for c in all_cosers if c["name"] == coser_name]
+                if not single_coser_list:
+                    print(f"\x1b[1;33m[WARNING] 未找到处于激活状态且名为 [{coser_name}] 的 Coser，请确认姓名拼写或启用状态。\x1b[0m")
+                    return 0, {}, 0
 
-            # B站抓取
-            if c["bilibili_uid"] and platform in ("bilibili", "all"):
-                success_platforms["bilibili"]["total"] += 1
-                try:
-                    posts = await bili_sc.fetch_bilibili_posts(c["bilibili_uid"], limit)
-                    if posts:
-                        ins = DBService.save_raw_posts(c["id"], "bilibili", posts)
-                        total_inserted += ins
-                    success_platforms["bilibili"]["success"] += 1
-                except Exception as e:
-                    log_event("ERROR", "scraper_bilibili", f"Coser [{c['name']}] B站抓取失败: {e}", str(e))
+            target_weibo_cosers = []
+            target_bili_cosers = []
+            target_xhs_cosers = []
 
-            # 小红书抓取
-            if c["xhs_uid"] and platform in ("xhs", "all"):
-                success_platforms["xhs"]["total"] += 1
-                try:
-                    posts = await xhs_sc.fetch_xhs_posts(c["xhs_uid"], limit)
-                    if posts:
-                        ins = DBService.save_raw_posts(c["id"], "xhs", posts)
-                        total_inserted += ins
-                    success_platforms["xhs"]["success"] += 1
-                except Exception as e:
-                    log_event("ERROR", "scraper_xhs", f"Coser [{c['name']}] 小红书抓取失败: {e}", str(e))
+            if coser_name:
+                if platform in ("weibo", "all"):
+                    target_weibo_cosers = [c for c in single_coser_list if c["weibo_uid"]]
+                if platform in ("bilibili", "all"):
+                    target_bili_cosers = [c for c in single_coser_list if c["bilibili_uid"]]
+                if platform in ("xhs", "all"):
+                    target_xhs_cosers = [c for c in single_coser_list if c["xhs_uid"]]
+                processed_coser_ids = set(c["id"] for c in single_coser_list)
+            else:
+                # 动态分配去重后的 Coser ID，避免各平台累加引起过度抓取 (CR 5)
+                weibo_candidates = DBService.list_active_cosers_by_schedule("weibo", batch_limit, conn=db_conn) if platform in ("weibo", "all") else []
+                bili_candidates = DBService.list_active_cosers_by_schedule("bilibili", batch_limit, conn=db_conn) if platform in ("bilibili", "all") else []
+                xhs_candidates = DBService.list_active_cosers_by_schedule("xhs", batch_limit, conn=db_conn) if platform in ("xhs", "all") else []
 
-        return total_cosers, success_platforms, total_inserted
+                weibo_idx, bili_idx, xhs_idx = 0, 0, 0
+                selected_unique_ids = set()
+
+                while len(selected_unique_ids) < batch_limit:
+                    added_any = False
+
+                    if weibo_idx < len(weibo_candidates):
+                        c = weibo_candidates[weibo_idx]
+                        weibo_idx += 1
+                        if len(selected_unique_ids) < batch_limit or c["id"] in selected_unique_ids:
+                            target_weibo_cosers.append(c)
+                            selected_unique_ids.add(c["id"])
+                            added_any = True
+
+                    if bili_idx < len(bili_candidates):
+                        c = bili_candidates[bili_idx]
+                        bili_idx += 1
+                        if len(selected_unique_ids) < batch_limit or c["id"] in selected_unique_ids:
+                            target_bili_cosers.append(c)
+                            selected_unique_ids.add(c["id"])
+                            added_any = True
+
+                    if xhs_idx < len(xhs_candidates):
+                        c = xhs_candidates[xhs_idx]
+                        xhs_idx += 1
+                        if len(selected_unique_ids) < batch_limit or c["id"] in selected_unique_ids:
+                            target_xhs_cosers.append(c)
+                            selected_unique_ids.add(c["id"])
+                            added_any = True
+
+                    if not added_any:
+                        break
+
+            # 1. 微博抓取
+            if platform in ("weibo", "all"):
+                for c in target_weibo_cosers:
+                    processed_coser_ids.add(c["id"])
+                    success_platforms["weibo"]["total"] += 1
+                    try:
+                        posts = await weibo_sc.fetch_weibo_posts(c["weibo_uid"], limit)
+                        if posts:
+                            ins = DBService.save_raw_posts(c["id"], "weibo", posts, conn=db_conn)
+                            total_inserted += ins
+                        success_platforms["weibo"]["success"] += 1
+                    except Exception as e:
+                        log_event("ERROR", "scraper_weibo", f"Coser [{c['name']}] 微博抓取失败: {e}", str(e))
+                    finally:
+                        DBService.update_scrape_timestamp(c["id"], "weibo", conn=db_conn)
+
+            # 2. B站抓取
+            if platform in ("bilibili", "all"):
+                for c in target_bili_cosers:
+                    processed_coser_ids.add(c["id"])
+                    success_platforms["bilibili"]["total"] += 1
+                    try:
+                        posts = await bili_sc.fetch_bilibili_posts(c["bilibili_uid"], limit)
+                        if posts:
+                            ins = DBService.save_raw_posts(c["id"], "bilibili", posts, conn=db_conn)
+                            total_inserted += ins
+                        success_platforms["bilibili"]["success"] += 1
+                    except Exception as e:
+                        log_event("ERROR", "scraper_bilibili", f"Coser [{c['name']}] B站抓取失败: {e}", str(e))
+                    finally:
+                        DBService.update_scrape_timestamp(c["id"], "bilibili", conn=db_conn)
+
+            # 3. 小红书抓取
+            if platform in ("xhs", "all"):
+                for c in target_xhs_cosers:
+                    processed_coser_ids.add(c["id"])
+                    success_platforms["xhs"]["total"] += 1
+                    try:
+                        posts = await xhs_sc.fetch_xhs_posts(c["xhs_uid"], limit)
+                        if posts:
+                            ins = DBService.save_raw_posts(c["id"], "xhs", posts, conn=db_conn)
+                            total_inserted += ins
+                        success_platforms["xhs"]["success"] += 1
+                    except Exception as e:
+                        log_event("ERROR", "scraper_xhs", f"Coser [{c['name']}] 小红书抓取失败: {e}", str(e))
+                    finally:
+                        DBService.update_scrape_timestamp(c["id"], "xhs", conn=db_conn)
+
+        finally:
+            db_conn.close()
+
+        return len(processed_coser_ids), success_platforms, total_inserted
+
 
 
     @staticmethod
@@ -135,4 +200,14 @@ class WorkflowOrchestrator:
         if failed_count > 0:
             print(f"\x1b[1;33m[Analyzer Breaker WARNING] 本轮分析共有 {failed_count} 条博文因数据格式/结构冲突触发熔断挂起 (is_analyzed = 2)，已跳过下轮重试。\x1b[0m")
             
+        # [Auto-Discovery] 触发 Coser 自动发现机制
+        try:
+            from src.services.discovery_service import DiscoveryService
+            print("\x1b[1;36m[Discovery] 正在分析增量博文的社交图谱以发现新 Coser...\x1b[0m")
+            discovered_count = await DiscoveryService.discover_candidates_from_posts(pending_posts)
+            if discovered_count > 0:
+                print(f"\x1b[1;32m[Discovery] 本轮分析成功自动发现并录入了 {discovered_count} 位新 Coser 候选人，请使用 'coser list-candidates' 查看并审核！\x1b[0m")
+        except Exception as discovery_err:
+            log_event("WARNING", "orchestrator_discovery", f"自动发现过程出现异常: {discovery_err}", str(discovery_err))
+
         return total_posts, success_events_count, analyzed_count

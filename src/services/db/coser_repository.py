@@ -111,10 +111,10 @@ class CoserRepository:
             conn.close()
 
     @staticmethod
-    def list_cosers(only_active: bool = False) -> list[dict]:
-        """获取 Coser 列表"""
-        conn = get_db_connection()
-        cursor = conn.cursor()
+    def list_cosers(only_active: bool = False, conn=None) -> list[dict]:
+        """获取所有追踪的 Coser 列表"""
+        local_conn = conn or get_db_connection()
+        cursor = local_conn.cursor()
         try:
             query = "SELECT id, name, weibo_uid, bilibili_uid, xhs_uid, is_active, created_at FROM cosers"
             if only_active:
@@ -134,7 +134,77 @@ class CoserRepository:
             ]
         finally:
             cursor.close()
-            conn.close()
+            if not conn:
+                local_conn.close()
+
+    @staticmethod
+    def list_active_cosers_by_schedule(platform: str, limit: int, conn=None) -> list[dict]:
+        """根据滑动窗口调度算法获取当前平台最久未被爬取的活跃 Coser 列表"""
+        if platform not in ("weibo", "bilibili", "xhs"):
+            raise ValueError(f"Invalid platform: {platform}")
+        local_conn = conn or get_db_connection()
+        cursor = local_conn.cursor()
+        try:
+            platform_uid_col = f"{platform}_uid"
+            query = f"""
+                SELECT c.id, c.name, c.weibo_uid, c.bilibili_uid, c.xhs_uid, c.is_active, c.created_at
+                FROM cosers c
+                LEFT JOIN coser_scrape_state s 
+                  ON c.id = s.coser_id AND s.platform = ?
+                WHERE c.is_active = 1 
+                  AND c.{platform_uid_col} IS NOT NULL 
+                  AND c.{platform_uid_col} != '' 
+                  AND c.{platform_uid_col} != '-'
+                ORDER BY s.last_scraped_at ASC
+                LIMIT ?;
+            """
+            cursor.execute(query, (platform, limit))
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "weibo_uid": r[2],
+                    "bilibili_uid": r[3],
+                    "xhs_uid": r[4],
+                    "is_active": r[5],
+                    "created_at": r[6]
+                } for r in rows
+            ]
+        finally:
+            cursor.close()
+            if not conn:
+                local_conn.close()
+
+    @staticmethod
+    def update_scrape_timestamp(coser_id: int, platform: str, conn=None) -> bool:
+        """更新对应平台的爬取时间戳，采用 INSERT OR REPLACE 逻辑支持首次写入"""
+        if platform not in ("weibo", "bilibili", "xhs"):
+            raise ValueError(f"Invalid platform: {platform}")
+        local_conn = conn or get_db_connection()
+        cursor = local_conn.cursor()
+        try:
+            import datetime
+            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO coser_scrape_state (coser_id, platform, last_scraped_at)
+                VALUES (?, ?, ?);
+                """,
+                (coser_id, platform, now_str)
+            )
+            local_conn.commit()
+            return True
+        except Exception as e:
+            local_conn.rollback()
+            print(f"\x1b[1;31m[Database ERROR] 更新爬取时间戳失败: {e}\x1b[0m")
+            return False
+        finally:
+            cursor.close()
+            if not conn:
+                local_conn.close()
+
 
     @staticmethod
     def get_active_cosers_without_bilibili() -> list[dict]:
@@ -226,10 +296,10 @@ class CoserRepository:
             conn.close()
 
     @staticmethod
-    def save_raw_posts(coser_id: int, platform: str, posts: list[dict]) -> int:
+    def save_raw_posts(coser_id: int, platform: str, posts: list[dict], conn=None) -> int:
         """保存原始博文记录，实现版本号比对去重与二次编辑更新"""
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        local_conn = conn or get_db_connection()
+        cursor = local_conn.cursor()
         inserted_count = 0
         try:
             beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
@@ -286,13 +356,12 @@ class CoserRepository:
                                 (coser_id, platform, versioned_post_id, content, post_url, edit_count, now_str, now_str)
                             )
                             inserted_count += 1
-                        # 若未编辑且内容相同，但 gRPC 拿到了更精确的 published_at，原位修正时间戳（不新增版本，不重置分析状态）
+                        # 若未编辑且物理编辑时间、内容完全相同，则作为重复记录直接过滤去重
                         elif not post.get("is_edited", False) and published_at and published_at != stored_published_at:
                             cursor.execute(
                                 "UPDATE raw_posts SET published_at = ?, scraped_at = ? WHERE id = ?;",
                                 (published_at, now_str, stored_id)
                             )
-                        # 若未编辑且物理编辑时间、内容完全相同，则作为重复记录直接过滤去重
                     # B站 Playwright 模式与小红书以及所有平台的虚拟 Bio 动态的自适应内容变动合成版本控制
                     elif platform == "xhs" or (platform == "bilibili" and not post.get("is_grpc")) or post_id.startswith("bio_"):
                         if content != stored_content:
@@ -350,15 +419,16 @@ class CoserRepository:
                         (coser_id, platform, post_id, content, post_url, edit_count, published_at, now_str)
                     )
                     inserted_count += 1
-            conn.commit()
+            local_conn.commit()
             return inserted_count
         except Exception as e:
-            conn.rollback()
+            local_conn.rollback()
             print(f"\x1b[1;31m[Database ERROR] 保存原始博文失败: {e}\x1b[0m")
             return 0
         finally:
             cursor.close()
-            conn.close()
+            if not conn:
+                local_conn.close()
 
     @staticmethod
     def get_unanalyzed_posts() -> list[dict]:

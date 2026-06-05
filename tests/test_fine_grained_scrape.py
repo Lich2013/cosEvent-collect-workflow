@@ -64,7 +64,16 @@ def _run_scrape_patched(cosers_fixture, coser_name=None, platform="all"):
 
     weibo_sc, bili_sc, xhs_sc = _make_scraper_mocks()
 
+    def mock_list_active_cosers_by_schedule(plat, limit, conn=None):
+        uid_col = f"{plat}_uid"
+        return [
+            c for c in cosers_fixture
+            if c.get(uid_col) is not None and c.get(uid_col) != '' and c.get(uid_col) != '-'
+        ][:limit]
+
     with patch("src.services.workflow_orchestrator.DBService.list_cosers", return_value=cosers_fixture), \
+         patch("src.services.workflow_orchestrator.DBService.list_active_cosers_by_schedule", side_effect=mock_list_active_cosers_by_schedule), \
+         patch("src.services.workflow_orchestrator.DBService.update_scrape_timestamp", return_value=True), \
          patch("src.services.workflow_orchestrator.DBService.save_raw_posts", return_value=1), \
          patch("src.services.workflow_orchestrator.WeiboScraper", return_value=weibo_sc), \
          patch("src.services.workflow_orchestrator.BilibiliScraper", return_value=bili_sc), \

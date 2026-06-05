@@ -216,7 +216,8 @@ uv run python src/main.py coser sync-bili --dry-run
 # 支持通过 --limit 限制单平台拉取数 (默认 10)
 # 支持通过 --name 过滤特定 Coser 姓名
 # 支持通过 --platform 过滤特定平台 (weibo/bilibili/xhs/all，默认 all)
-uv run python src/main.py scrape --limit 10 --name "池咲misa" --platform bilibili
+# 支持通过 --batch-size 限制单次最大分配去重 Coser 总量 (默认 30，实现有状态滑动窗口分批调度，规避风控阻断)
+uv run python src/main.py scrape --limit 10 --name "池咲misa" --platform bilibili --batch-size 30
 
 # 2. 独立分析任务 (增量拉取未处理博文，大模型分析，事务原子级录入 events 并标记状态)
 # 支持通过 --confidence-threshold 过滤基准置信度 (默认 0.3)
@@ -226,9 +227,10 @@ uv run python src/main.py analyze --confidence-threshold 0.3
 uv run python src/main.py materialize
 
 # 4. 统一调度进程 (顺序执行 scrape 爬取与 analyze 提炼后，在最末尾自动级联执行一次离线物化重建)
-uv run python src/main.py process
+# 支持通过 --batch-size 限制单次最大爬取去重 Coser 总量 (默认 30)
+uv run python src/main.py process --batch-size 30
 ```
-* **细粒度过滤 (`--name` / `--platform`)**：在数据爬取阶段，你可以通过指定 `--name` 匹配特定的 Coser，指定 `--platform` 匹配特定的社交平台，系统将自动裁剪执行任务，旁路无需运行的 Scraper 实例和 Playwright 浏览器会话，大幅提升单点调试与更新的效率。不提供参数时自动回退为全量并发爬行。
+* **细粒度过滤与滑动窗口调度 (`--name` / `--platform` / `--batch-size`)**：在数据爬取阶段，你可以通过指定 `--name` 匹配特定的 Coser，指定 `--platform` 匹配特定的社交平台以进行单点调试；在全量调度模式下，建议通过 `--batch-size`（默认 30）限制单次处理的去重活跃 Coser 总数。系统采用有状态时间滑动窗口算法，优先拉取各个平台最久未更新（或未爬取）的 Coser 列表，并在多个平台间采用公平的轮转机制（Round-Robin）动态分配配额，在保障队列流畅推进的同时完美规避高频风控阻断。
 * **物化展示重建时机**：爬取分析和物化去重在物理上完全解耦以降低 SQLite 并发锁冲突。日程数据以只读状态存入 cosplay_events 事实表，展示层的数据一致性通过 `materialize` 重建指令（或 `process` 主任务链结束后自动级联调用）在原子写锁中一次性刷新物化表。
 
 #### 🔹 多格式与多范围精细过滤导出 (Export)

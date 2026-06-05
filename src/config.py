@@ -26,6 +26,8 @@ class Settings:
         self.bilibili_grpc_mobi_app = "android_hd"
         self.bilibili_grpc_device = "pad"
         self.bilibili_grpc_build = 1410100
+        self.bilibili_grpc_ticket = ""
+        self.bilibili_grpc_ticket_expires_at = 0
         
         # 动态自适应地级市列表
         self.custom_cities = []
@@ -75,6 +77,8 @@ class Settings:
                         self.bilibili_grpc_mobi_app = bili_grpc.get("mobi_app", "android_hd")
                         self.bilibili_grpc_device = bili_grpc.get("device", "pad")
                         self.bilibili_grpc_build = bili_grpc.get("build", 1410100)
+                        self.bilibili_grpc_ticket = bili_grpc.get("ticket", "")
+                        self.bilibili_grpc_ticket_expires_at = bili_grpc.get("ticket_expires_at", 0)
             except Exception as e:
                 print(f"\x1b[1;31m[Warning] 读取配置文件 settings.yaml 失败，使用系统默认配置: {e}\x1b[0m")
 
@@ -85,11 +89,24 @@ class Settings:
         self.bilibili_grpc_mobi_app = self._resolve_env_var(self.bilibili_grpc_mobi_app)
         self.bilibili_grpc_device = self._resolve_env_var(self.bilibili_grpc_device)
         self.bilibili_grpc_build = self._resolve_env_var(self.bilibili_grpc_build)
+        self.bilibili_grpc_ticket = self._resolve_env_var(self.bilibili_grpc_ticket)
+        self.bilibili_grpc_ticket_expires_at = self._resolve_env_var(self.bilibili_grpc_ticket_expires_at)
 
         if not self.bilibili_grpc_access_token:
             self.bilibili_grpc_access_token = os.environ.get("BILIBILI_ACCESS_TOKEN", "")
         if not self.bilibili_grpc_refresh_token:
             self.bilibili_grpc_refresh_token = os.environ.get("BILIBILI_REFRESH_TOKEN", "")
+        if not self.bilibili_grpc_ticket:
+            self.bilibili_grpc_ticket = os.environ.get("BILIBILI_TICKET", "")
+        
+        # 处理 ticket_expires_at 过期时间解析
+        expires_val = self.bilibili_grpc_ticket_expires_at
+        if not expires_val:
+            expires_val = os.environ.get("BILIBILI_TICKET_EXPIRES_AT", "0")
+        try:
+            self.bilibili_grpc_ticket_expires_at = int(expires_val)
+        except (ValueError, TypeError):
+            self.bilibili_grpc_ticket_expires_at = 0
         if not self.bilibili_grpc_mid:
             mid_env = os.environ.get("BILIBILI_MID", "0")
             if str(mid_env).isdigit():

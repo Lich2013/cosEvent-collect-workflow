@@ -192,16 +192,72 @@ def sync_bili_command(limit, dry_run):
     # 4. 渲染精美的表格同步报告
     TerminalRenderer.render_sync_bili_report(report)
 
+@coser.command("list-candidates")
+@click.option("--status", default="pending", type=click.Choice(["pending", "approved", "ignored"]), help="按状态过滤候选人列表，默认 pending")
+def list_candidates_command(status):
+    """[Coser Candidates] 查看自动发现的 Coser 候选记录"""
+    init_db()
+    candidates = DBService.list_candidates(status)
+    click.echo(f"\n--- {status.upper()} Coser 候选人列表 (共 {len(candidates)} 人) ---")
+    TerminalRenderer.render_candidates_table(candidates)
+
+@coser.command("approve-candidate")
+@click.option("--id", "candidate_id", type=int, required=True, help="要批准导入正式库的候选人 ID")
+def approve_candidate_command(candidate_id):
+    """[Coser Candidates] 批准候选人导入正式库"""
+    init_db()
+    if DBService.approve_candidate(candidate_id):
+        click.secho(f"✓ 成功批准候选人 ID [{candidate_id}] 并导入正式 Coser 列表！", fg="green", bold=True)
+    else:
+        click.secho(f"✗ 批准候选人 ID [{candidate_id}] 失败，请检查 ID 是否正确且状态是否为 pending。", fg="red", bold=True)
+
+@coser.command("reject-candidate")
+@click.option("--id", "candidate_id", type=int, required=True, help="要忽略/拒绝的候选人 ID")
+def reject_candidate_command(candidate_id):
+    """[Coser Candidates] 忽略/拒绝候选人"""
+    init_db()
+    if DBService.reject_candidate(candidate_id):
+        click.secho(f"✓ 成功忽略候选人 ID [{candidate_id}]！", fg="yellow", bold=True)
+    else:
+        click.secho(f"✗ 忽略候选人 ID [{candidate_id}] 失败，请检查 ID 是否正确且状态是否为 pending。", fg="red", bold=True)
+
+@coser.command("discover")
+@click.option("--limit", default=15, type=int, help="本次最多检索/验证新候选人的名额上限，默认 15")
+def discover_command(limit):
+    """[Coser Candidates] 手动触发对现有未处理/所有已分析博文进行 Coser 提及提取与自动发现"""
+    init_db()
+    click.secho("⏳ 正在拉取最近博文进行 @提及 提取分析...", fg="cyan")
+    
+    from src.models.db_models import get_db_connection
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT content, post_url, coser_id FROM raw_posts ORDER BY id DESC LIMIT 100;")
+        rows = cursor.fetchall()
+        posts = [{"content": r[0], "post_url": r[1], "coser_id": r[2]} for r in rows]
+    finally:
+        cursor.close()
+        conn.close()
+        
+    if not posts:
+        click.secho("没有在数据库中找到任何博文记录，无法进行发现分析。", fg="yellow")
+        return
+        
+    from src.services.discovery_service import DiscoveryService
+    discovered_count = asyncio.run(DiscoveryService.discover_candidates_from_posts(posts, limit))
+    click.secho(f"\n✓ 自动发现任务结束。本轮共成功录入 {discovered_count} 个 pending 新候选人！", fg="green", bold=True)
+
 @cli.command("scrape")
 @click.option("--limit", default=None, type=int, help="单一平台单次最大爬取条数 (覆盖默认配置)")
 @click.option("--name", default=None, help="仅更新指定姓名/昵称的 Coser 动态")
 @click.option("--platform", type=click.Choice(["weibo", "bilibili", "xhs", "all"]), default="all", help="仅更新指定平台的数据（默认 all）")
-def scrape_command(limit, name, platform):
+@click.option("--batch-size", default=30, type=int, help="每次调度最大 Coser 数量限制，默认 30")
+def scrape_command(limit, name, platform, batch_size):
     """[Scrape Phase] 异步去重抓取活跃 Coser 博文动态"""
     init_db()
     lim = limit or settings.default_limit
     total_cosers, success_platforms, total_inserted = asyncio.run(
-        WorkflowOrchestrator.run_scrape(lim, coser_name=name, platform=platform)
+        WorkflowOrchestrator.run_scrape(lim, coser_name=name, platform=platform, batch_size=batch_size)
     )
     click.echo("\n" + "=" * 40)
     click.secho("[Scraper 爬取单步完成]", fg="yellow", bold=True)
@@ -223,14 +279,14 @@ def analyze_command(confidence_threshold):
     click.echo(f"- 成功回写状态博文数: {analyzed_count} 条")
     click.echo("=" * 40 + "\n")
 
-async def _async_process(limit, confidence_threshold):
+async def _async_process(limit, confidence_threshold, batch_size=None):
     """主工作流定时调度串联逻辑，爬虫出错不阻断分析"""
     click.echo("\n" + "=" * 40)
     click.secho("🤖 步骤 1/2: 正在启动异步去重新增爬取任务...", fg="yellow", bold=True)
     click.echo("=" * 40)
     total_cosers, success_platforms, total_inserted = 0, {"weibo": {"success": 0, "total": 0}, "bilibili": {"success": 0, "total": 0}, "xhs": {"success": 0, "total": 0}}, 0
     try:
-        total_cosers, success_platforms, total_inserted = await WorkflowOrchestrator.run_scrape(limit)
+        total_cosers, success_platforms, total_inserted = await WorkflowOrchestrator.run_scrape(limit, batch_size=batch_size)
     except Exception as e:
         click.secho(f"✗ 爬行阶段遭遇严重阻断异常: {e}", fg="red")
         
@@ -282,12 +338,13 @@ async def _async_process(limit, confidence_threshold):
 @cli.command("process")
 @click.option("--limit", default=None, type=int, help="单一平台最大爬取条数")
 @click.option("--confidence-threshold", default=None, type=float, help="过滤基准置信度")
-def process_command(limit, confidence_threshold):
+@click.option("--batch-size", default=30, type=int, help="每次调度最大 Coser 数量限制，默认 30")
+def process_command(limit, confidence_threshold, batch_size):
     """[Process master] 依次调度 scrape 和 analyze，提供完备报告"""
     init_db()
     lim = limit or settings.default_limit
     threshold = confidence_threshold if confidence_threshold is not None else settings.analyze_confidence_threshold
-    asyncio.run(_async_process(lim, threshold))
+    asyncio.run(_async_process(lim, threshold, batch_size=batch_size))
 
 @cli.command("summary")
 @click.option("--by-event", is_flag=True, help="按漫展超级节点展现集结详情看板")
