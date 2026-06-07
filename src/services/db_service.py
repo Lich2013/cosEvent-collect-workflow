@@ -47,8 +47,8 @@ class DBService:
     # 1.5. Coser 候选管理委托 (归于 CandidateRepository)
     # ==============================================================================
     @staticmethod
-    def add_candidate(name: str, platform: str, source_ref: str = None, matched_bili_uid: str = None, matched_weibo_uid: str = None, matched_xhs_uid: str = None, match_score: float = 0.0) -> bool:
-        return CandidateRepository.add_candidate(name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score)
+    def add_candidate(name: str, platform: str, source_ref: str = None, matched_bili_uid: str = None, matched_weibo_uid: str = None, matched_xhs_uid: str = None, match_score: float = 0.0, is_verified: int = 0, verify_reason: str = None) -> bool:
+        return CandidateRepository.add_candidate(name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score, is_verified, verify_reason)
 
     @staticmethod
     def list_candidates(status: str = "pending") -> list[dict]:
@@ -61,6 +61,10 @@ class DBService:
     @staticmethod
     def reject_candidate(candidate_id: int) -> bool:
         return CandidateRepository.reject_candidate(candidate_id)
+
+    @staticmethod
+    def save_candidate_raw_posts(candidate_id: int, platform: str, posts: list[dict]) -> int:
+        return CandidateRepository.save_candidate_raw_posts(candidate_id, platform, posts)
 
     # ==============================================================================
     # 2. 原始博文保存与冲突版本控制委托 (归于 CoserRepository)

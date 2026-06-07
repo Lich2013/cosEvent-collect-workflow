@@ -179,3 +179,97 @@ async def test_discovery_service_integration():
         assert pending[0]["name"] == "小红帽_cos"
         assert pending[0]["matched_bili_uid"] == "999888"
         assert pending[0]["match_score"] > 0.0
+
+@pytest.mark.asyncio
+async def test_candidate_post_verification_llm_flow():
+    """测试候选人博文抓取及 LLM 智能体分类评估的全套流程"""
+    # 1. 注册一个 pending 候选人，且预先绑定 B站 UID
+    CandidateRepository.add_candidate(
+        name="测试核验用户",
+        platform="bilibili",
+        matched_bili_uid="1234567"
+    )
+    
+    pending = DBService.list_candidates("pending")
+    assert len(pending) == 1
+    cand_id = pending[0]["id"]
+    
+    # 2. 模拟爬虫返回博文
+    mock_posts = [
+        {"post_id": "1", "content": "今天CP30第一天芙宁娜返图，欢迎来摊位找我！", "post_url": "http://t.bilibili.com/1", "published_at": "2026-06-06 20:00:00"},
+        {"post_id": "2", "content": "下周六一日店长排班表出来啦！", "post_url": "http://t.bilibili.com/2", "published_at": "2026-06-05 20:00:00"},
+    ]
+    
+    # 模拟 LLM 智能体评估返回
+    mock_llm_res = {
+        "is_active_coser": True,
+        "confidence": 0.95,
+        "reason": "博文中含有漫展返图及一日店长排班信息"
+    }
+    
+    with patch("src.tools.bilibili_scraper.BilibiliScraper.fetch_bilibili_posts", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+         
+        mock_fetch.return_value = mock_posts
+        mock_llm.return_value = mock_llm_res
+        
+        # 执行核验
+        verified_count = await DiscoveryService.verify_pending_candidates(limit=5)
+        assert verified_count == 1
+        
+        # 3. 验证数据库中候选人的状态被更新为 is_verified = 1 且带有 verify_reason
+        pending_after = DBService.list_candidates("pending")
+        assert len(pending_after) == 1
+        cand_after = pending_after[0]
+        assert cand_after["is_verified"] == 1
+        assert "[LLM]" in cand_after["verify_reason"]
+        assert "博文中含有漫展返图及一日店长排班信息" in cand_after["verify_reason"]
+        
+        # 4. 验证博文已物理隔离保存到 candidate_raw_posts 中
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM candidate_raw_posts WHERE candidate_id = ? ORDER BY id ASC;", (cand_id,))
+        rows = cursor.fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] == "今天CP30第一天芙宁娜返图，欢迎来摊位找我！"
+        assert rows[1][0] == "下周六一日店长排班表出来啦！"
+        cursor.close()
+        conn.close()
+
+@pytest.mark.asyncio
+async def test_candidate_post_verification_llm_negative_flow():
+    """测试候选人博文经 LLM 判定为非 Coser 时的忽略逻辑"""
+    CandidateRepository.add_candidate(
+        name="纯生活分享用户",
+        platform="weibo",
+        matched_weibo_uid="8888888"
+    )
+    
+    pending = DBService.list_candidates("pending")
+    assert len(pending) == 1
+    cand_id = pending[0]["id"]
+    
+    mock_posts = [
+        {"post_id": "weibo_1", "content": "今天天气真好，吃了个火锅。", "post_url": "http://weibo.com/1", "published_at": "2026-06-06 20:00:00"},
+    ]
+    
+    mock_llm_res = {
+        "is_active_coser": False,
+        "confidence": 0.99,
+        "reason": "仅为日常生活的碎碎念分享"
+    }
+    
+    with patch("src.tools.weibo_scraper.WeiboScraper.fetch_weibo_posts", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+         
+        mock_fetch.return_value = mock_posts
+        mock_llm.return_value = mock_llm_res
+        
+        # 执行核验
+        verified_count = await DiscoveryService.verify_pending_candidates(limit=5)
+        assert verified_count == 0  # 判定失败，未被核验通过
+        
+        # 确认候选人被标记为 ignored
+        ignored = DBService.list_candidates("ignored")
+        assert len(ignored) == 1
+        assert ignored[0]["id"] == cand_id

@@ -232,9 +232,9 @@ def discover_command(limit):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT content, post_url, coser_id FROM raw_posts ORDER BY id DESC LIMIT 100;")
+        cursor.execute("SELECT content, post_url, coser_id, platform FROM raw_posts ORDER BY id DESC LIMIT 100;")
         rows = cursor.fetchall()
-        posts = [{"content": r[0], "post_url": r[1], "coser_id": r[2]} for r in rows]
+        posts = [{"content": r[0], "post_url": r[1], "coser_id": r[2], "platform": r[3]} for r in rows]
     finally:
         cursor.close()
         conn.close()

@@ -1,4 +1,8 @@
 import os
+# 优化 gRPC 与 Playwright 等多进程/Fork 场景下的兼容性，避免 ares_resolver 触发 check failed 导致崩溃 (GRPC Fork-safe)
+os.environ["GRPC_DNS_RESOLVER"] = "native"
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "true"
+
 import re
 from pathlib import Path
 import yaml

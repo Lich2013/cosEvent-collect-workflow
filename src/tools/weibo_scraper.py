@@ -146,3 +146,46 @@ class WeiboScraper(BaseScraper):
             return posts
  
         return await self.scrape_flow_handler(_scrape_weibo, uid, limit)
+
+    async def resolve_screen_name(self, screen_name: str) -> dict:
+        """根据微博昵称查询其用户详细信息（包含 UID、简介等）"""
+        res_map = await self.resolve_screen_names_batch([screen_name])
+        return res_map.get(screen_name, {})
+
+    async def resolve_screen_names_batch(self, screen_names: list[str]) -> dict[str, dict]:
+        """批量解析微博昵称，返回 昵称 -> 用户信息 字典"""
+        if not screen_names:
+            return {}
+            
+        print(f"\x1b[1;33m[Scraper] [{self.platform}] 启动批量解析 {len(screen_names)} 个昵称\x1b[0m")
+        
+        async def _resolve_batch(context, names: list[str]):
+            page = await context.new_page()
+            try:
+                # 访问 weibo.com 域以确保 cookie 注入
+                await page.goto("https://weibo.com/")
+            except Exception as e:
+                print(f"\x1b[1;33m[Scraper Warning] [weibo] 批量解析初始化页面失败: {e}\x1b[0m")
+                return {}
+                
+            results = {}
+            import urllib.parse
+            import asyncio
+            
+            for name in names:
+                if not name or not str(name).strip():
+                    continue
+                encoded_name = urllib.parse.quote(name)
+                url = f"https://weibo.com/ajax/profile/info?screen_name={encoded_name}"
+                try:
+                    res = await page.evaluate(f"async () => {{ const res = await fetch('{url}'); return await res.json(); }}")
+                    if res and res.get("ok") == 1 and "data" in res:
+                        results[name] = res["data"].get("user") or {}
+                except Exception as e:
+                    print(f"\x1b[1;33m[Scraper Warning] [weibo] 批量解析 [{name}] 失败 ({e})\x1b[0m")
+                # 微小的延迟防风控
+                await asyncio.sleep(0.3)
+            return results
+            
+        return await self.scrape_flow_handler(_resolve_batch, screen_names)
+

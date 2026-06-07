@@ -64,3 +64,18 @@ class FusionJudgeOutput(BaseModel):
         ...,
         description="判定的核心依据与逻辑推理理由（如缩写对齐、中英文别名等）"
     )
+
+class CandidateVerifyOutput(BaseModel):
+    """候选人博文纯文本核验智能体输出契约"""
+    is_active_coser: bool = Field(
+        ...,
+        description="根据近期的博文判断该博主是否为活跃的 Coser（发片预告、正片、场照或排班计划等）"
+    )
+    confidence: float = Field(
+        ...,
+        description="对于此判定的置信度评分，0.0 至 1.0 之间"
+    )
+    reason: str = Field(
+        ...,
+        description="判定理由，结合博文中的证据简短描述"
+    )

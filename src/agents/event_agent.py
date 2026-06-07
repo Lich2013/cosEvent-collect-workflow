@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from pydantic import ValidationError
 from agents import Agent, Runner, RunConfig
-from src.models.schemas import FinalOutput, TriageOutput
+from src.models.schemas import FinalOutput, TriageOutput, CandidateVerifyOutput
 from src.config import settings
 from src.utils.llm_factory import registry_model_provider
 from src.utils.templates import render_instruction_template
@@ -233,3 +233,56 @@ async def analyze_post_with_retry(content: str, url: str, published_at: str | No
         return await pipeline.run_consensus_pipeline(content, url, published_at, input_text)
     else:
         return await pipeline.run_single_pipeline(content, url, published_at, input_text)
+
+async def analyze_candidate_posts(candidate_name: str, posts: list[dict]) -> dict:
+    """
+    使用 CandidateVerifyAgent 评估候选人最近的博文，判断是否为活跃 Coser。
+    """
+    # 获取默认或配置的模型提供商与模型名
+    prov = settings.analysis_pipeline.get("triage_provider", "openai")
+    mod = settings.analysis_pipeline.get("triage_model", "gpt-4o-mini")
+    model_spec = f"{prov}/{mod}"
+    
+    verify_agent = Agent(
+        name="candidate_verify_agent",
+        instructions="你是一个二次元 Cosplay 专家审查员。根据用户提供的博主姓名及最近博文列表，进行客观评估，判断该博主是否是一个真实的、活跃的 Coser。必须严格遵循规定的 Pydantic 强契约输出。",
+        output_type=CandidateVerifyOutput,
+        model=model_spec
+    )
+    
+    # 渲染输入模板
+    input_prompt = render_instruction_template(
+        "candidate_verify.jinja2",
+        candidate_name=candidate_name,
+        posts=posts
+    )
+    
+    run_cfg = RunConfig(model_provider=registry_model_provider)
+    
+    max_retries = 3
+    feedback_prompt = input_prompt
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"\x1b[1;34m[Agent] 启动候选人 [{candidate_name}] 文本核验分析 (尝试 {attempt}/{max_retries})...\x1b[0m")
+            res = await Runner.run(
+                verify_agent,
+                feedback_prompt,
+                run_config=run_cfg
+            )
+            final_data = res.final_output
+            if final_data and hasattr(final_data, "is_active_coser"):
+                return final_data.model_dump()
+            else:
+                raise ValueError("核验智能体未成功返回结构化的 CandidateVerifyOutput 实例")
+        except (ValidationError, Exception) as e:
+            err_msg = f"核验智能体在第 {attempt} 次核验时发生异常: {e}"
+            print(f"\x1b[1;33m[Agent Warning] {err_msg}\x1b[0m")
+            log_event("WARNING", "candidate_verify_agent", err_msg, str(e))
+            if attempt == max_retries:
+                err_final = f"已达最大重试上限，候选人 [{candidate_name}] 核验失败，将向上传播异常以保持其 pending 状态。"
+                print(f"\x1b[1;31m[Agent ERROR] {err_final}\x1b[0m")
+                log_event("ERROR", "candidate_verify_agent", err_final, str(e))
+                raise e
+            
+            feedback_prompt = f"{input_prompt}\n\n⚠️ 【系统反馈：你上一次提取未通过 Pydantic 强校验，报错如下。请绝对依据错误修正输出格式】\n{str(e)}"

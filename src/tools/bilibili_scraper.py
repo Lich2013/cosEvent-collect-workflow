@@ -85,11 +85,12 @@ def gen_fp(buvid_val, model="Mi 11"):
     return f"{fp_raw}{veri_code_hex}"
 
 def _extract_text_and_author_from_item(item):
-    """从 gRPC DynamicItem 中提取发布作者、文本正文、转发原动态等"""
+    """从 gRPC DynamicItem 中提取发布作者、文本正文、转发原动态等，以及 @提及列表"""
     author_name = "原作者"
     content_text = ""
     ptime_label = ""
     orig_item = None
+    mentions = []
     
     for mod in item.modules:
         which_item = mod.WhichOneof("module_item")
@@ -105,6 +106,23 @@ def _extract_text_and_author_from_item(item):
             if summary.WhichOneof("content") == "text":
                 for node in summary.text.nodes:
                     text_parts.append(node.raw_text)
+                    if node.link:
+                        biz_id_str = str(node.link.biz_id or "").strip()
+                        link_url = node.link.link or ""
+                        is_user_link = False
+                        if "space.bilibili.com/" in link_url or biz_id_str:
+                            is_user_link = True
+                            
+                        if is_user_link:
+                            uname = node.link.show_text.strip().lstrip("@").strip()
+                            uid = biz_id_str
+                            if not uid and "space.bilibili.com/" in link_url:
+                                import re
+                                m = re.search(r"space\.bilibili\.com/(\d+)", link_url)
+                                if m:
+                                    uid = m.group(1)
+                            if uname and uid and uid != "0":
+                                mentions.append({"name": uname, "uid": uid})
             content_text = "".join(text_parts)
         elif which_item == "module_dynamic":
             dyn_item = mod.module_dynamic
@@ -112,7 +130,7 @@ def _extract_text_and_author_from_item(item):
             if which_dyn == "dyn_forward":
                 orig_item = dyn_item.dyn_forward.item
                 
-    return author_name, content_text, ptime_label, orig_item
+    return author_name, content_text, ptime_label, orig_item, mentions
 
 # Bilibili 已知的各客户端 AppKey 与 AppSecret，用于刷新 Token 时自动匹配签名算法
 APP_CREDENTIALS = {
@@ -445,20 +463,30 @@ class BilibiliScraper(BaseScraper):
             post_id = str(item.extend.dyn_id_str)
             if not post_id or post_id == "0":
                 continue
-            # 提取正文、作者、时间以及转发原博
-            author_name, content_text, ptime_label, orig_item = _extract_text_and_author_from_item(item)
+            # 提取正文、作者、时间以及转发原博，还有 mentions
+            author_name, content_text, ptime_label, orig_item, mentions = _extract_text_and_author_from_item(item)
             
-            # 如果成功拿到了高精度 DynDetail，使用其 module_author 字段的 ptime_label_text 强行覆盖以防时间戳陈旧
+            # 如果成功拿到了高精度 DynDetail，使用其 module_author 字段的 ptime_label_text 强行覆盖以防时间戳陈旧，也合并 mentions
             if post_id in details_map:
                 detail_item = details_map[post_id].item
-                _, _, detail_ptime, _ = _extract_text_and_author_from_item(detail_item)
+                _, _, detail_ptime, _, detail_mentions = _extract_text_and_author_from_item(detail_item)
                 if detail_ptime:
                     ptime_label = detail_ptime
+                if detail_mentions:
+                    seen_uids = {m["uid"] for m in mentions}
+                    for dm in detail_mentions:
+                        if dm["uid"] not in seen_uids:
+                            mentions.append(dm)
 
             # 合并转发原博
             if orig_item:
-                orig_author, orig_content, _, _ = _extract_text_and_author_from_item(orig_item)
+                orig_author, orig_content, _, _, orig_mentions = _extract_text_and_author_from_item(orig_item)
                 content_text = f"转发了 @{orig_author} 的动态：“{orig_content}”\n说：“{content_text}”"
+                if orig_mentions:
+                    seen_uids = {m["uid"] for m in mentions}
+                    for om in orig_mentions:
+                        if om["uid"] not in seen_uids:
+                            mentions.append(om)
                 
             if not content_text.strip():
                 continue
@@ -474,7 +502,8 @@ class BilibiliScraper(BaseScraper):
                 "edit_count": 0,  # 物理版本控制的 edit_count 在数据库层自动合并增长
                 "published_at": published_at,
                 "is_grpc": True,
-                "is_edited": is_edited
+                "is_edited": is_edited,
+                "mentions": mentions
             })
             
         # 提取 signature 字段并合成为虚拟动态（执行非空过滤门槛）
@@ -519,7 +548,8 @@ class BilibiliScraper(BaseScraper):
                 "content": f"[个人简介] {bio.strip()}",
                 "post_url": f"https://space.bilibili.com/{uid}",
                 "edit_count": 0,
-                "published_at": now_str
+                "published_at": now_str,
+                "mentions": []
             })
 
         return posts
@@ -907,7 +937,8 @@ class BilibiliScraper(BaseScraper):
                         "content": content_text,
                         "post_url": post_url,
                         "edit_count": 0,
-                        "published_at": published_at
+                        "published_at": published_at,
+                        "mentions": []
                     })
             
             # DOM 签名 (Bio) 降级兜底
@@ -930,14 +961,15 @@ class BilibiliScraper(BaseScraper):
                     "content": f"[个人简介] {bio.strip()}",
                     "post_url": f"https://space.bilibili.com/{uid}",
                     "edit_count": 0,
-                    "published_at": now_str
+                    "published_at": now_str,
+                    "mentions": []
                 })
             return posts
 
         return await self.scrape_flow_handler(_scrape_bili, uid, limit)
 
     async def search_bilibili_user(self, keyword: str) -> list[dict]:
-        """通过 Playwright 网页搜索并拦截 B站 用户检索接口，返回 UP 主候选人列表"""
+        """通过 Playwright 网页直接检索 B站 用户，返回 UP 主候选人列表"""
         if not keyword or not str(keyword).strip():
             return []
             
@@ -946,145 +978,120 @@ class BilibiliScraper(BaseScraper):
         async def _search_bili(context, keyword: str):
             page = await context.new_page()
             await page.set_extra_http_headers({
-                "Referer": "https://www.bilibili.com",
+                "Referer": "https://search.bilibili.com/upuser",
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             })
             
             candidates = []
-            target_url = f"https://search.bilibili.com/upuser?keyword={keyword}"
+            import urllib.parse
+            import re
+            target_url = f"https://search.bilibili.com/upuser?keyword={urllib.parse.quote(str(keyword))}"
             
             try:
-                # 拦截包含 search/type 或 search/all 且含有 bili_user 且状态为 200 的接口
-                async with page.expect_response(
-                    lambda resp: ("search/type" in resp.url or "search/all" in resp.url or "search" in resp.url) 
-                                 and "bili_user" in resp.url 
-                                 and resp.status == 200,
-                    timeout=10000
-                ) as resp_info:
-                    await page.goto(target_url)
+                # 直接导航，等待网络空闲以加载 SSR 数据
+                await page.goto(target_url, wait_until="networkidle", timeout=12000)
                 
-                response = await resp_info.value
-                content = await response.json()
-                
-                results = []
-                if "data" in content and "result" in content["data"]:
-                    results = content["data"]["result"]
-                elif "result" in content:
-                    results = content["result"]
-                    
-                if results and isinstance(results, list):
-                    for item in results:
-                        uname = item.get("uname") or item.get("title")
-                        if uname and "<em" in uname:
-                            import re
-                            uname = re.sub(r"<[^>]+>", "", uname)
-                            
-                        mid = str(item.get("mid") or item.get("id") or "")
-                        fans = int(item.get("fans", 0))
-                        
-                        official_verify = item.get("official_verify") or {}
-                        verify_type = official_verify.get("type", -1)
-                        verify_desc = official_verify.get("desc", "")
-                        
-                        if uname and mid:
-                            candidates.append({
-                                "uname": uname,
-                                "mid": mid,
-                                "fans": fans,
-                                "official_verify": {
-                                    "type": verify_type,
-                                    "desc": verify_desc
-                                }
-                            })
-            except Exception as e:
-                print(f"\x1b[1;33m[Scraper Warning] 拦截 B站 搜索接口超时或失败，尝试解析页面 DOM 兜底: {e}\x1b[0m")
-                try:
-                    # 自适应选择链：定位用户卡片容器
-                    await page.wait_for_selector(".up-item, .user-item, .user-content, [class*='user-item'], [class*='user-content']", timeout=5000)
+                # 兼容性选择：定位用户卡片容器 (优先新版, 其次旧版)
+                up_items = await page.query_selector_all(".b-user-info-card")
+                if not up_items:
                     up_items = await page.query_selector_all(".up-item, .user-item, .user-content, [class*='user-item'], [class*='user-content']")
-                    
-                    for item in up_items[:5]:
-                        # 1. 提取昵称与 UID：基于 space.bilibili.com 硬主页超链接锚点
+                
+                for item in up_items[:8]:
+                    # 1. 提取昵称与 UID
+                    link_el = await item.query_selector(".i_card_title a[href*='space.bilibili.com']")
+                    if not link_el:
                         link_el = await item.query_selector("a[href*='space.bilibili.com']")
-                        if not link_el:
-                            # 备选：读取卡片中的任何包含 /space/ 的 <a>
-                            link_el = await item.query_selector("a[href*='/space/']")
+                    
+                    if not link_el:
+                        continue
                         
-                        if not link_el:
-                            continue
+                    uname = (await link_el.inner_text()).strip()
+                    href = await link_el.get_attribute("href") or ""
+                    
+                    # 防御：如果 uname 为空，尝试从 link_el 的 title 属性，或者其他 name 选择器提取
+                    if not uname:
+                        uname = (await link_el.get_attribute("title") or "").strip()
+                    if not uname:
+                        name_el = await item.query_selector(".i_card_title, h2, a.text1")
+                        if name_el:
+                            uname = (await name_el.inner_text()).strip()
                             
-                        uname = (await link_el.inner_text()).strip()
-                        href = await link_el.get_attribute("href") or ""
+                    mid = ""
+                    if "space.bilibili.com/" in href:
+                        mid = href.split("space.bilibili.com/")[-1].split("?")[0].strip("/")
+                    elif href:
+                        m = re.search(r"\d+", href)
+                        if m:
+                            mid = m.group()
+                            
+                    # 2. 提取粉丝数与个人简介
+                    fans = 0
+                    usign = ""
+                    
+                    p_el = await item.query_selector("p:has-text('粉丝')")
+                    if not p_el:
+                        p_el = await item.query_selector(".fans, .text2, p.b_text, [class*='fans']")
                         
-                        mid = ""
-                        if "space.bilibili.com/" in href:
-                            mid = href.split("space.bilibili.com/")[-1].split("?")[0].strip("/")
-                        elif href:
-                            import re
-                            m = re.search(r"\d+", href)
-                            if m:
-                                mid = m.group()
+                    if p_el:
+                        text = (await p_el.get_attribute("title") or await p_el.inner_text() or "").strip()
+                        fans_match = re.search(r"([\d\.]+)(万)?\s*粉丝", text)
+                        if fans_match:
+                            try:
+                                val = float(fans_match.group(1))
+                                is_wan = fans_match.group(2) is not None
+                                fans = int(val * 10000) if is_wan else int(val)
+                            except ValueError:
+                                pass
                                 
-                        # 2. 提取粉丝数与个人简介：基于文本关键字特征解析
-                        fans = 0
-                        usign = ""
-                        
-                        # 查找包含“粉丝”字样的段落
-                        p_el = await item.query_selector("p:has-text('粉丝')")
-                        if not p_el:
-                            # 备选类名定位
-                            p_el = await item.query_selector(".fans, .text2, p.b_text, [class*='fans']")
-                            
-                        if p_el:
-                            # 优先读取 title 属性，防字符截断；若无则读取 inner_text
-                            text = (await p_el.get_attribute("title") or await p_el.inner_text() or "").strip()
-                            
-                            # 匹配粉丝数（支持 "5.8万粉丝" 或 "128粉丝"）
-                            import re
-                            fans_match = re.search(r"([\d\.]+)(万)?\s*粉丝", text)
-                            if fans_match:
-                                try:
-                                    val = float(fans_match.group(1))
-                                    is_wan = fans_match.group(2) is not None
-                                    fans = int(val * 10000) if is_wan else int(val)
-                                except ValueError:
-                                    pass
+                        span_el = await p_el.query_selector("span")
+                        if span_el:
+                            span_text = (await span_el.inner_text()).strip()
+                            if span_text and span_text != "无":
+                                usign = span_text
+                        else:
+                            sig_match = re.search(r"视频\s*·?\s*(.*)", text)
+                            if sig_match:
+                                usign = sig_match.group(1).strip()
+                                if usign == "无":
+                                    usign = ""
                                     
-                            # 提取个人简介 (usign)
-                            # 优先查找内层 <span>，若没有，则提取 “视频” 字样之后的所有文本作为简介
-                            span_el = await p_el.query_selector("span")
-                            if span_el:
-                                usign = (await span_el.inner_text()).strip()
-                            else:
-                                sig_match = re.search(r"视频\s*·?\s*(.*)", text)
-                                if sig_match:
-                                    usign = sig_match.group(1).strip()
-                                    
-                        # 备选个人简介定位
-                        if not usign:
-                            desc_el = await item.query_selector(".desc, [class*='desc']")
-                            if desc_el:
-                                usign = (await desc_el.inner_text()).strip()
+                    if not usign:
+                        desc_el = await item.query_selector(".desc, [class*='desc']")
+                        if desc_el:
+                            usign = (await desc_el.inner_text()).strip()
+                            if usign == "无":
+                                usign = ""
                                 
-                        # 3. 提取 B站 官方认证信息 (仅当存在 B站 官方认证标识选择器时)
-                        verify_desc = ""
-                        auth_el = await item.query_selector(".auth-desc, .personal-auth, .official-auth, [class*='auth-desc'], [class*='personal-auth']")
-                        if auth_el:
-                            verify_desc = (await auth_el.inner_text()).strip()
-                                
-                        if uname and mid:
-                            candidates.append({
-                                "uname": uname,
-                                "mid": mid,
-                                "fans": fans,
-                                "usign": usign,
-                                "official_verify": {
-                                    "type": 0 if verify_desc else -1,
-                                    "desc": verify_desc
-                                }
-                            })
-                except Exception as dom_err:
-                    print(f"\x1b[1;31m[Scraper ERROR] DOM 兜底解析也失败: {dom_err}\x1b[0m")
+                    # 3. 提取 B站 官方认证信息
+                    verify_desc = ""
+                    auth_el = await item.query_selector(".auth-desc, .personal-auth, .official-auth, [class*='auth-desc'], [class*='personal-auth']")
+                    if auth_el:
+                        verify_desc = (await auth_el.inner_text()).strip()
+                    
+                    # 自适应：如果在 usign 中检测到认证特征，且 verify_desc 为空，则补充 verify_desc
+                    if usign and not verify_desc:
+                        is_verify = False
+                        verify_keywords = ["知名", "认证", "官方", "优质", "首发", "主播", "代表", "工作室", "企业", "歌手", "演员", "公司"]
+                        for vkw in verify_keywords:
+                            if vkw in usign:
+                                is_verify = True
+                                break
+                        if is_verify:
+                            verify_desc = usign
+                            
+                    if uname and mid:
+                        candidates.append({
+                            "uname": uname,
+                            "mid": mid,
+                            "fans": fans,
+                            "usign": usign,
+                            "official_verify": {
+                                "type": 0 if verify_desc else -1,
+                                "desc": verify_desc
+                            }
+                        })
+            except Exception as e:
+                print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] 检索 [{keyword}] 页面加载失败: {e}\x1b[0m")
             finally:
                 await page.close()
                 
@@ -1102,13 +1109,14 @@ class BilibiliScraper(BaseScraper):
         async def _search_batch(context, keywords: list[str]):
             page = await context.new_page()
             await page.set_extra_http_headers({
-                "Referer": "https://www.bilibili.com",
+                "Referer": "https://search.bilibili.com/upuser",
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             })
             
             results_map = {}
-            import time
             import random
+            import urllib.parse
+            import re
             
             for i, kw in enumerate(keywords):
                 if not kw or not str(kw).strip():
@@ -1120,144 +1128,111 @@ class BilibiliScraper(BaseScraper):
                     await asyncio.sleep(delay)
                     
                 candidates = []
-                target_url = f"https://search.bilibili.com/upuser?keyword={kw}"
+                target_url = f"https://search.bilibili.com/upuser?keyword={urllib.parse.quote(str(kw))}"
                 
                 try:
-                    # 拦截并提取 Ajax 接口（缩短超时为 2.5s，秒级风控响应）
-                    async with page.expect_response(
-                        lambda resp: ("search/type" in resp.url or "search/all" in resp.url or "search" in resp.url) 
-                                     and "bili_user" in resp.url 
-                                     and resp.status == 200,
-                        timeout=2500
-                    ) as resp_info:
-                        await page.goto(target_url)
+                    await page.goto(target_url, wait_until="networkidle", timeout=12000)
                     
-                    response = await resp_info.value
-                    content = await response.json()
-                    
-                    results = []
-                    if "data" in content and "result" in content["data"]:
-                        results = content["data"]["result"]
-                    elif "result" in content:
-                        results = content["result"]
-                        
-                    if results and isinstance(results, list):
-                        for item in results:
-                            uname = item.get("uname") or item.get("title")
-                            if uname and "<em" in uname:
-                                import re
-                                uname = re.sub(r"<[^>]+>", "", uname)
-                                
-                            mid = str(item.get("mid") or item.get("id") or "")
-                            fans = int(item.get("fans", 0))
-                            
-                            official_verify = item.get("official_verify") or {}
-                            verify_type = official_verify.get("type", -1)
-                            verify_desc = official_verify.get("desc", "")
-                            
-                            # 提取用户签名进行社交媒体交叉验证
-                            usign = item.get("usign") or ""
-                            
-                            if uname and mid:
-                                candidates.append({
-                                    "uname": uname,
-                                    "mid": mid,
-                                    "fans": fans,
-                                    "usign": usign,
-                                    "official_verify": {
-                                        "type": verify_type,
-                                        "desc": verify_desc
-                                    }
-                                })
-                except Exception as e:
-                    print(f"\x1b[1;33m[Scraper Warning] 检索 [{kw}] 接口超时(2.5s)或风控，降级至 DOM 兜底: {e}\x1b[0m")
-                    try:
-                        # 自适应选择链：定位用户卡片容器
-                        await page.wait_for_selector(".up-item, .user-item, .user-content, [class*='user-item'], [class*='user-content']", timeout=3000)
+                    up_items = await page.query_selector_all(".b-user-info-card")
+                    if not up_items:
                         up_items = await page.query_selector_all(".up-item, .user-item, .user-content, [class*='user-item'], [class*='user-content']")
                         
-                        for item in up_items[:5]:
-                            # 1. 提取昵称与 UID：基于 space.bilibili.com 硬主页超链接锚点
+                    for item in up_items[:8]:
+                        # 1. 提取昵称与 UID
+                        link_el = await item.query_selector(".i_card_title a[href*='space.bilibili.com']")
+                        if not link_el:
                             link_el = await item.query_selector("a[href*='space.bilibili.com']")
-                            if not link_el:
-                                # 备选：读取卡片中的任何包含 /space/ 的 <a>
-                                link_el = await item.query_selector("a[href*='/space/']")
-                                
-                            if not link_el:
-                                continue
-                                
-                            uname = (await link_el.inner_text()).strip()
-                            href = await link_el.get_attribute("href") or ""
+                        
+                        if not link_el:
+                            continue
                             
-                            mid = ""
-                            if "space.bilibili.com/" in href:
-                                mid = href.split("space.bilibili.com/")[-1].split("?")[0].strip("/")
-                            elif href:
-                                import re
-                                m = re.search(r"\d+", href)
-                                if m:
-                                    mid = m.group()
-                                    
-                            # 2. 提取粉丝数与个人简介：基于文本关键字特征解析
-                            fans = 0
-                            usign = ""
+                        uname = (await link_el.inner_text()).strip()
+                        href = await link_el.get_attribute("href") or ""
+                        
+                        # 防御：如果 uname 为空，尝试从 link_el 的 title 属性，或者其他 name 选择器提取
+                        if not uname:
+                            uname = (await link_el.get_attribute("title") or "").strip()
+                        if not uname:
+                            name_el = await item.query_selector(".i_card_title, h2, a.text1")
+                            if name_el:
+                                uname = (await name_el.inner_text()).strip()
+                                
+                        mid = ""
+                        if "space.bilibili.com/" in href:
+                            mid = href.split("space.bilibili.com/")[-1].split("?")[0].strip("/")
+                        elif href:
+                            m = re.search(r"\d+", href)
+                            if m:
+                                mid = m.group()
+                                
+                        # 2. 提取粉丝数与个人简介
+                        fans = 0
+                        usign = ""
+                        
+                        p_el = await item.query_selector("p:has-text('粉丝')")
+                        if not p_el:
+                            p_el = await item.query_selector(".fans, .text2, p.b_text, [class*='fans']")
                             
-                            # 查找包含“粉丝”字样的段落
-                            p_el = await item.query_selector("p:has-text('粉丝')")
-                            if not p_el:
-                                # 备选类名定位
-                                p_el = await item.query_selector(".fans, .text2, p.b_text, [class*='fans']")
-                                
-                            if p_el:
-                                # 优先读取 title 属性，防字符截断；若无则读取 inner_text
-                                text = (await p_el.get_attribute("title") or await p_el.inner_text() or "").strip()
-                                
-                                # 匹配粉丝数（支持 "5.8万粉丝" 或 "128粉丝"）
-                                import re
-                                fans_match = re.search(r"([\d\.]+)(万)?\s*粉丝", text)
-                                if fans_match:
-                                    try:
-                                        val = float(fans_match.group(1))
-                                        is_wan = fans_match.group(2) is not None
-                                        fans = int(val * 10000) if is_wan else int(val)
-                                    except ValueError:
-                                        pass
-                                        
-                                # 提取个人简介 (usign)
-                                # 优先查找内层 <span>，若没有，则提取 “视频” 字样之后的所有文本作为简介
-                                span_el = await p_el.query_selector("span")
-                                if span_el:
-                                    usign = (await span_el.inner_text()).strip()
-                                else:
-                                    sig_match = re.search(r"视频\s*·?\s*(.*)", text)
-                                    if sig_match:
-                                        usign = sig_match.group(1).strip()
-                                        
-                            # 备选个人简介定位
-                            if not usign:
-                                desc_el = await item.query_selector(".desc, [class*='desc']")
-                                if desc_el:
-                                    usign = (await desc_el.inner_text()).strip()
+                        if p_el:
+                            text = (await p_el.get_attribute("title") or await p_el.inner_text() or "").strip()
+                            fans_match = re.search(r"([\d\.]+)(万)?\s*粉丝", text)
+                            if fans_match:
+                                try:
+                                    val = float(fans_match.group(1))
+                                    is_wan = fans_match.group(2) is not None
+                                    fans = int(val * 10000) if is_wan else int(val)
+                                except ValueError:
+                                    pass
                                     
-                            # 3. 提取 B站 官方认证信息 (仅当存在 B站 官方认证标识选择器时)
-                            verify_desc = ""
-                            auth_el = await item.query_selector(".auth-desc, .personal-auth, .official-auth, [class*='auth-desc'], [class*='personal-auth']")
-                            if auth_el:
-                                verify_desc = (await auth_el.inner_text()).strip()
+                            span_el = await p_el.query_selector("span")
+                            if span_el:
+                                span_text = (await span_el.inner_text()).strip()
+                                if span_text and span_text != "无":
+                                    usign = span_text
+                            else:
+                                sig_match = re.search(r"视频\s*·?\s*(.*)", text)
+                                if sig_match:
+                                    usign = sig_match.group(1).strip()
+                                    if usign == "无":
+                                        usign = ""
+                                        
+                        if not usign:
+                            desc_el = await item.query_selector(".desc, [class*='desc']")
+                            if desc_el:
+                                usign = (await desc_el.inner_text()).strip()
+                                if usign == "无":
+                                    usign = ""
                                     
-                            if uname and mid:
-                                candidates.append({
-                                    "uname": uname,
-                                    "mid": mid,
-                                    "fans": fans,
-                                    "usign": usign,
-                                    "official_verify": {
-                                        "type": 0 if verify_desc else -1,
-                                        "desc": verify_desc
-                                    }
-                                })
-                    except Exception as dom_err:
-                        print(f"\x1b[1;31m[Scraper ERROR] DOM 兜底解析 [{kw}] 也失败: {dom_err}\x1b[0m")
+                        # 3. 提取 B站 官方认证信息
+                        verify_desc = ""
+                        auth_el = await item.query_selector(".auth-desc, .personal-auth, .official-auth, [class*='auth-desc'], [class*='personal-auth']")
+                        if auth_el:
+                            verify_desc = (await auth_el.inner_text()).strip()
+                        
+                        # 自适应：如果在 usign 中检测到认证特征，且 verify_desc 为空，则补充 verify_desc
+                        if usign and not verify_desc:
+                            is_verify = False
+                            verify_keywords = ["知名", "认证", "官方", "优质", "首发", "主播", "代表", "工作室", "企业", "歌手", "演员", "公司"]
+                            for vkw in verify_keywords:
+                                if vkw in usign:
+                                    is_verify = True
+                                    break
+                            if is_verify:
+                                verify_desc = usign
+                                
+                        if uname and mid:
+                            candidates.append({
+                                "uname": uname,
+                                "mid": mid,
+                                "fans": fans,
+                                "usign": usign,
+                                "official_verify": {
+                                    "type": 0 if verify_desc else -1,
+                                    "desc": verify_desc
+                                }
+                            })
+                except Exception as e:
+                    print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] 检索 [{kw}] 页面加载失败: {e}\x1b[0m")
                 
                 results_map[kw] = candidates
                 
@@ -1268,3 +1243,74 @@ class BilibiliScraper(BaseScraper):
         if isinstance(res, list):
             return {}
         return res
+
+    async def resolve_uids_batch(self, uids: list[str]) -> dict[str, dict]:
+        """批量解析 B站 UIDs，通过导航到个人空间主页并拦截 acc/info 接口来提取完整签名与官方认证"""
+        if not uids:
+            return {}
+            
+        print(f"\x1b[1;33m[Scraper] [{self.platform}] 启动批量用户空间解析，共 {len(uids)} 个 UID\x1b[0m")
+        
+        async def _resolve_batch(context, uids_list: list[str]):
+            page = await context.new_page()
+            results = {}
+            import asyncio
+            import random
+            
+            for i, uid in enumerate(uids_list):
+                if not uid or not str(uid).strip():
+                    continue
+                    
+                if i > 0:
+                    delay = random.uniform(1.5, 3.0)
+                    await asyncio.sleep(delay)
+                    
+                bio = ""
+                uname = ""
+                verify_desc = ""
+                
+                async def on_response(response):
+                    nonlocal bio, uname, verify_desc
+                    if "api.bilibili.com/x/space/wbi/acc/info" in response.url and response.status == 200:
+                        try:
+                            acc_data = await response.json()
+                            if "data" in acc_data:
+                                data = acc_data["data"]
+                                if data.get("sign"):
+                                    bio = data["sign"].strip()
+                                if data.get("name"):
+                                    uname = data["name"].strip()
+                                if data.get("official") and data["official"].get("title"):
+                                    verify_desc = data["official"]["title"].strip()
+                        except Exception:
+                            pass
+                            
+                page.on("response", on_response)
+                
+                target_url = f"https://space.bilibili.com/{uid}"
+                try:
+                    await page.goto(target_url, wait_until="networkidle", timeout=12000)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(f"\x1b[1;33m[Scraper Warning] [bilibili] 访问空间 {uid} 页面加载失败/超时: {e}\x1b[0m")
+                    
+                page.remove_listener("response", on_response)
+                
+                # DOM 签名 (Bio) 降级兜底
+                if not bio:
+                    try:
+                        sign_el = page.locator(".h-sign")
+                        if await sign_el.is_visible(timeout=2000):
+                            bio = (await sign_el.inner_text()).strip()
+                    except Exception:
+                        pass
+                        
+                results[uid] = {
+                    "uname": uname,
+                    "bio": bio,
+                    "verify_desc": verify_desc
+                }
+            await page.close()
+            return results
+            
+        return await self.scrape_flow_handler(_resolve_batch, uids)

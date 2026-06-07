@@ -209,6 +209,23 @@ uv run python src/main.py coser sync-bili --dry-run
 * **`--dry-run`**：仅执行搜索与启发式打分，输出候选对比报告，不写入数据库，适合在正式同步前人工审核结果。
 * **批量复用会话**：所有 Coser 的检索在单次 Playwright 浏览器会话中完成，避免重复冷启动开销。
 
+#### 🔹 Coser 候选人自动发现与管理 (Candidates)
+
+系统在爬取博文时，如果发现博文中 @ 艾特了其他的二次元/Coser 昵称，会自动记录在候选人队列中。你可以手动触发提及提取，并对候选人进行审核导入：
+```bash
+# 1. 手动触发对最近博文的提及提取与分析 (默认名额上限 15)
+uv run python src/main.py coser discover --limit 15
+
+# 2. 查看当前已发现的 Coser 候选人列表 (支持 pending / approved / ignored，默认 pending)
+uv run python src/main.py coser list-candidates --status pending
+
+# 3. 批准候选人导入正式追踪库
+uv run python src/main.py coser approve-candidate --id <候选人_ID>
+
+# 4. 忽略/拒绝候选人
+uv run python src/main.py coser reject-candidate --id <候选人_ID>
+```
+
 #### 🔹 执行数据采集与分析提炼
 本系统在物理和逻辑上支持完全的爬行与分析解耦：
 ```bash
@@ -294,3 +311,15 @@ uv run python src/main.py calendar --type 一日店长 --scope all
 * **`--scope`**：`future`（默认，仅保留 `end_date >= 今日` 或日期未知的节点）/ `all`（含历史全量）。
 * **`--type`**：默认值为 `漫展`，可切换为 `一日店长`、`摄影会` 等小众类型，实现大型漫展与小众活动的视觉分流。
 * **输出格式**：按举办月份物理分组（如 `2026年5月`），月份内按日期升序排列，每个漫展节点显示名称、时间范围、城市场馆，以及 `👥 已集结 N 位 Coser` 的参展人数统计。
+
+#### 🔹 维护与辅助工具 (Utilities)
+
+```bash
+# 1. 手动初始化 SQLite 数据库表结构 (用于在本地从零拉起或重建表)
+uv run python src/main.py init-db
+
+# 2. 一键物理去重并合并冗余的超级活动节点
+# 合并由于拼写或缩写差异而重复产生的漫展超级节点，物理级归一化并合并 Coser 参展关联
+uv run python src/main.py deduplicate
+```
+

@@ -128,7 +128,7 @@ def init_db():
         );
         """)
         
-        # 5.7 创建 coser_candidates 表 (新发现的 Coser 候选表)
+        # 5.7 创建 coser_candidates 表 (新发现 of Coser 候选表)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS coser_candidates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,8 +140,35 @@ def init_db():
             matched_xhs_uid TEXT,
             match_score REAL DEFAULT 0.0,
             status TEXT DEFAULT 'pending',
+            is_verified INTEGER DEFAULT 0,
+            verify_reason TEXT,
             created_at TEXT,
             CHECK (status IN ('pending', 'approved', 'ignored'))
+        );
+        """)
+
+        # 5.7.5 创建 candidate_raw_posts 表 (候选人隔离博文表)
+        cursor.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name='candidate_raw_posts';")
+        row = cursor.fetchone()
+        if row:
+            old_sql = row[0] or ""
+            # 检测旧版本的唯一约束 (去除空格以便匹配)
+            if "UNIQUE(platform,post_id)" in old_sql.replace(" ", ""):
+                print("\x1b[1;33m[Database Migration] 检测到旧版本的 candidate_raw_posts 唯一约束，准备重建该表以更新约束...\x1b[0m")
+                cursor.execute("DROP TABLE candidate_raw_posts;")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_raw_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            post_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            post_url TEXT,
+            published_at TEXT,
+            scraped_at TEXT,
+            FOREIGN KEY(candidate_id) REFERENCES coser_candidates(id) ON DELETE CASCADE,
+            UNIQUE(candidate_id, platform, post_id)
         );
         """)
         
@@ -188,6 +215,16 @@ def init_db():
         if "event_type" not in ne_columns:
             cursor.execute("ALTER TABLE normalized_events ADD COLUMN event_type TEXT DEFAULT '漫展';")
             print("\x1b[1;32m[Database Migration] 成功为 normalized_events 表追加 event_type 列。\x1b[0m")
+
+        # 自动为 coser_candidates 检测并追加 is_verified 与 verify_reason 字段
+        cursor.execute("PRAGMA table_info(coser_candidates);")
+        cc_columns = [col[1] for col in cursor.fetchall()]
+        if "is_verified" not in cc_columns:
+            cursor.execute("ALTER TABLE coser_candidates ADD COLUMN is_verified INTEGER DEFAULT 0;")
+            print("\x1b[1;32m[Database Migration] 成功为 coser_candidates 表追加 is_verified 列。\x1b[0m")
+        if "verify_reason" not in cc_columns:
+            cursor.execute("ALTER TABLE coser_candidates ADD COLUMN verify_reason TEXT;")
+            print("\x1b[1;32m[Database Migration] 成功为 coser_candidates 表追加 verify_reason 列。\x1b[0m")
             
         conn.commit()
         print("\x1b[1;32m[Database] 数据库表结构初始化及迁移升级成功。\x1b[0m")

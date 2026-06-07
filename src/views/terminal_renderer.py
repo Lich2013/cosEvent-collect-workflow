@@ -191,16 +191,28 @@ class TerminalRenderer:
         for c in candidates:
             score_val = c.get("match_score")
             score_str = f"{score_val:.1f}" if (score_val is not None and isinstance(score_val, (int, float))) else "-"
+            
+            # 使用绿色高亮显示已核验候选人
+            is_verified = c.get("is_verified", 0) == 1
+            if is_verified:
+                name_str = click.style(c["name"], fg="green", bold=True)
+                verify_status_str = click.style("已核验", fg="green")
+            else:
+                name_str = c["name"]
+                verify_status_str = click.style("待核验", fg="yellow")
+                
             table_data.append([
                 c["id"],
-                c["name"],
+                name_str,
                 c["platform"],
                 c["matched_bili_uid"] or "-",
                 score_str,
+                verify_status_str,
+                c.get("verify_reason") or "-",
                 c["status"],
                 c["source_ref"] or "-",
                 c["created_at"]
             ])
             
-        headers = ["ID", "Coser 昵称", "发现平台", "匹配 B站 UID", "匹配分", "状态", "来源链接", "发现时间"]
+        headers = ["ID", "Coser 昵称", "发现平台", "匹配 B站 UID", "匹配分", "核验状态", "核验理由", "审批状态", "来源链接", "发现时间"]
         click.echo(tabulate(table_data, headers=headers, tablefmt="grid"))
