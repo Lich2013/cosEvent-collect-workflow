@@ -34,7 +34,7 @@ class CandidateRepository:
             
             if row:
                 cand_id, status = row
-                if status == "pending":
+                if status in ("pending", "undetermined"):
                     # 查询既存属性以便合并，防止新扫描的空字段覆盖掉旧的有效 UID (Finding 5)
                     cursor.execute(
                         """
@@ -52,13 +52,13 @@ class CandidateRepository:
                     merged_score = match_score if match_score > 0.0 else (exist_score or 0.0)
                     merged_ref = source_ref if source_ref else exist_ref
                     merged_plat = platform if platform else exist_plat
-                    merged_verified = is_verified if is_verified != 0 else (exist_verified or 0)
-                    merged_reason = verify_reason if verify_reason else exist_reason
+                    merged_verified = is_verified if is_verified != 0 else 0
+                    merged_reason = verify_reason if verify_reason else None
 
                     cursor.execute(
                         """
                         UPDATE coser_candidates 
-                        SET platform = ?, source_ref = ?, matched_bili_uid = ?, matched_weibo_uid = ?, matched_xhs_uid = ?, match_score = ?, is_verified = ?, verify_reason = ?, created_at = ?
+                        SET platform = ?, source_ref = ?, matched_bili_uid = ?, matched_weibo_uid = ?, matched_xhs_uid = ?, match_score = ?, is_verified = ?, verify_reason = ?, status = 'pending', status_updated_at = ?
                         WHERE id = ?;
                         """,
                         (merged_plat, merged_ref, merged_bili, merged_weibo, merged_xhs, merged_score, merged_verified, merged_reason, now_str, cand_id)
@@ -73,10 +73,10 @@ class CandidateRepository:
             cursor.execute(
                 """
                 INSERT INTO coser_candidates 
-                (name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score, status, is_verified, verify_reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?);
+                (name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score, status, is_verified, verify_reason, status_updated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?);
                 """,
-                (name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score, is_verified, verify_reason, now_str)
+                (name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score, is_verified, verify_reason, now_str, now_str)
             )
             conn.commit()
             return True
@@ -134,13 +134,13 @@ class CandidateRepository:
                 """
                 SELECT name, matched_bili_uid, matched_weibo_uid, matched_xhs_uid 
                 FROM coser_candidates 
-                WHERE id = ? AND status = 'pending';
+                WHERE id = ? AND status IN ('pending', 'undetermined');
                 """,
                 (candidate_id,)
             )
             row = cursor.fetchone()
             if not row:
-                log_event("WARNING", "CandidateRepository", f"未找到 ID 为 {candidate_id} 且处于 pending 状态的候选人")
+                log_event("WARNING", "CandidateRepository", f"未找到 ID 为 {candidate_id} 且处于 pending 或 undetermined 状态的候选人")
                 return False
                 
             name, bili_uid, weibo_uid, xhs_uid = row
@@ -196,8 +196,8 @@ class CandidateRepository:
                 
             # 3. 标记候选人为 approved
             cursor.execute(
-                "UPDATE coser_candidates SET status = 'approved' WHERE id = ?;",
-                (candidate_id,)
+                "UPDATE coser_candidates SET status = 'approved', status_updated_at = ? WHERE id = ?;",
+                (now_str, candidate_id)
             )
             
             # 4. 物理清理该候选人关联的临时博文数据
@@ -222,9 +222,11 @@ class CandidateRepository:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
             cursor.execute(
-                "UPDATE coser_candidates SET status = 'ignored' WHERE id = ? AND status = 'pending';",
-                (candidate_id,)
+                "UPDATE coser_candidates SET status = 'ignored', status_updated_at = ? WHERE id = ? AND status IN ('pending', 'undetermined');",
+                (now_str, candidate_id)
             )
             updated = cursor.rowcount > 0
             if updated:
@@ -238,6 +240,35 @@ class CandidateRepository:
         except Exception as e:
             conn.rollback()
             log_event("ERROR", "CandidateRepository", f"忽略候选人 ID {candidate_id} 失败: {e}", str(e))
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
+    def set_candidate_undetermined(candidate_id: int) -> bool:
+        """将候选人标记为 undetermined，并物理清理该候选人关联的临时博文数据"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                "UPDATE coser_candidates SET status = 'undetermined', status_updated_at = ? WHERE id = ? AND status = 'pending';",
+                (now_str, candidate_id)
+            )
+            updated = cursor.rowcount > 0
+            if updated:
+                # 物理清理该候选人关联的临时博文数据
+                cursor.execute(
+                    "DELETE FROM candidate_raw_posts WHERE candidate_id = ?;",
+                    (candidate_id,)
+                )
+            conn.commit()
+            return updated
+        except Exception as e:
+            conn.rollback()
+            log_event("ERROR", "CandidateRepository", f"标记候选人 ID {candidate_id} 为待定失败: {e}", str(e))
             return False
         finally:
             cursor.close()

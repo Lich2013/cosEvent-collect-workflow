@@ -101,7 +101,7 @@ async def test_verify_pending_candidates_weibo_resolution():
         assert verified_count == 1
         
         # 校验数据库状态是否更新为通过，且匹配到 weibo_uid，bili_uid 为 None
-        candidates = DBService.list_candidates("pending")
+        candidates = DBService.list_candidates("approved")
         assert len(candidates) == 1
         cand = candidates[0]
         assert cand["matched_weibo_uid"] == "7188636063"

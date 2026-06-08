@@ -189,3 +189,37 @@ class WeiboScraper(BaseScraper):
             
         return await self.scrape_flow_handler(_resolve_batch, screen_names)
 
+    async def resolve_uids_batch(self, uids: list[str]) -> dict[str, dict]:
+        """批量解析微博 UID，返回 UID -> 用户信息 字典"""
+        if not uids:
+            return {}
+            
+        print(f"\x1b[1;33m[Scraper] [{self.platform}] 启动批量解析 {len(uids)} 个 UID\x1b[0m")
+        
+        async def _resolve_batch(context, uids_list: list[str]):
+            page = await context.new_page()
+            try:
+                await page.goto("https://weibo.com/")
+            except Exception as e:
+                print(f"\x1b[1;33m[Scraper Warning] [weibo] 批量解析初始化页面失败: {e}\x1b[0m")
+                return {}
+                
+            results = {}
+            import asyncio
+            
+            for uid in uids_list:
+                if not uid or not str(uid).strip():
+                    continue
+                url = f"https://weibo.com/ajax/profile/info?uid={uid}"
+                try:
+                    res = await page.evaluate(f"async () => {{ const res = await fetch('{url}'); return await res.json(); }}")
+                    if res and res.get("ok") == 1 and "data" in res:
+                        results[str(uid)] = res["data"].get("user") or {}
+                except Exception as e:
+                    print(f"\x1b[1;33m[Scraper Warning] [weibo] 批量解析 UID [{uid}] 失败 ({e})\x1b[0m")
+                # 微小的延迟防风控
+                await asyncio.sleep(0.3)
+            return results
+            
+        return await self.scrape_flow_handler(_resolve_batch, uids)
+

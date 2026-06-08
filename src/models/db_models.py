@@ -129,6 +129,44 @@ def init_db():
         """)
         
         # 5.7 创建 coser_candidates 表 (新发现 of Coser 候选表)
+        cursor.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name='coser_candidates';")
+        row = cursor.fetchone()
+        if row:
+            old_sql = row[0] or ""
+            if "'undetermined'" not in old_sql:
+                print("\x1b[1;33m[Database Migration] 检测到旧版本的 coser_candidates 状态约束，准备重建该表以更新约束...\x1b[0m")
+                cursor.execute("PRAGMA foreign_keys = OFF;")
+                cursor.execute("ALTER TABLE coser_candidates RENAME TO coser_candidates_old;")
+                cursor.execute("""
+                CREATE TABLE coser_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    platform TEXT NOT NULL,
+                    source_ref TEXT,
+                    matched_bili_uid TEXT,
+                    matched_weibo_uid TEXT,
+                    matched_xhs_uid TEXT,
+                    match_score REAL DEFAULT 0.0,
+                    status TEXT DEFAULT 'pending',
+                    is_verified INTEGER DEFAULT 0,
+                    verify_reason TEXT,
+                    status_updated_at TEXT,
+                    created_at TEXT,
+                    CHECK (status IN ('pending', 'approved', 'ignored', 'undetermined'))
+                );
+                """)
+                cursor.execute("""
+                INSERT INTO coser_candidates (
+                    id, name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score, status, is_verified, verify_reason, status_updated_at, created_at
+                )
+                SELECT 
+                    id, name, platform, source_ref, matched_bili_uid, matched_weibo_uid, matched_xhs_uid, match_score, status, is_verified, verify_reason, created_at, created_at
+                FROM coser_candidates_old;
+                """)
+                cursor.execute("DROP TABLE coser_candidates_old;")
+                cursor.execute("PRAGMA foreign_keys = ON;")
+                print("\x1b[1;32m[Database Migration] 成功完成 coser_candidates 表影子表热迁移，新增 'undetermined' 状态支持。\x1b[0m")
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS coser_candidates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,10 +180,12 @@ def init_db():
             status TEXT DEFAULT 'pending',
             is_verified INTEGER DEFAULT 0,
             verify_reason TEXT,
+            status_updated_at TEXT,
             created_at TEXT,
-            CHECK (status IN ('pending', 'approved', 'ignored'))
+            CHECK (status IN ('pending', 'approved', 'ignored', 'undetermined'))
         );
         """)
+
 
         # 5.7.5 创建 candidate_raw_posts 表 (候选人隔离博文表)
         cursor.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name='candidate_raw_posts';")
@@ -225,7 +265,12 @@ def init_db():
         if "verify_reason" not in cc_columns:
             cursor.execute("ALTER TABLE coser_candidates ADD COLUMN verify_reason TEXT;")
             print("\x1b[1;32m[Database Migration] 成功为 coser_candidates 表追加 verify_reason 列。\x1b[0m")
+        if "status_updated_at" not in cc_columns:
+            cursor.execute("ALTER TABLE coser_candidates ADD COLUMN status_updated_at TEXT;")
+            print("\x1b[1;32m[Database Migration] 成功为 coser_candidates 表追加 status_updated_at 列。\x1b[0m")
             
+        # 无条件执行存量 status_updated_at 数据兜底修复，防止影子表迁移或旧记录中遗留 NULL 值导致排序饥饿或冷却失效
+        cursor.execute("UPDATE coser_candidates SET status_updated_at = created_at WHERE status_updated_at IS NULL;")
         conn.commit()
         print("\x1b[1;32m[Database] 数据库表结构初始化及迁移升级成功。\x1b[0m")
     except Exception as e:

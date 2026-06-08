@@ -1,6 +1,7 @@
 import re
 import asyncio
 import datetime
+from src.config import settings
 from src.services.db_service import DBService
 from src.tools.bilibili_scraper import BilibiliScraper
 from src.services.bili_uid_matcher import BiliUidMatcher
@@ -46,7 +47,7 @@ class DiscoveryService:
 
     @staticmethod
     def register_candidates_from_posts(posts: list[dict]) -> int:
-        """从博文中提取所有提及的 @用户名，无损并物理安全地注册为未验证的候选人（不设截断）"""
+        """从博文中提取所有提及的 @用户名，无损并物理安全地注册为未验证的候选人（不设限制）"""
         if not posts:
             return 0
 
@@ -80,7 +81,8 @@ class DiscoveryService:
         candidates = (
             DBService.list_candidates(status="pending") + 
             DBService.list_candidates(status="approved") + 
-            DBService.list_candidates(status="ignored")
+            DBService.list_candidates(status="ignored") +
+            DBService.list_candidates(status="undetermined")
         )
 
         existing_names = {c["name"].lower() for c in cosers}
@@ -111,30 +113,61 @@ class DiscoveryService:
         return registered_count
 
     @staticmethod
+    def has_strong_match(text: str) -> bool:
+        if not text:
+            return False
+        text_lower = text.lower()
+        strong_kws = settings.coser_keywords.get("strong") or ["cosplay", "coser", "排班", "嘉宾", "发片"]
+        return any(kw in text_lower for kw in strong_kws)
+
+    @staticmethod
+    def has_weak_match(text: str) -> bool:
+        if not text:
+            return False
+        text_lower = text.lower()
+        weak_kws = settings.coser_keywords.get("weak") or [
+            "cos", "二次元", "工作", "合作", "店长", "签售", "模特", 
+            "写真", "博主", "次元", "主页", "摄影", "后期", "妆造", "画师"
+        ]
+        return any(kw in text_lower for kw in weak_kws)
+
+    @staticmethod
     async def verify_pending_candidates(limit: int = 15) -> int:
-        """从缓冲队列捞取未验证的 pending 候选人，执行 B站 检索与打分验证"""
+        """从缓冲队列捞取未验证的 pending/undetermined 候选人，执行 B站 检索与打分验证"""
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
             cursor.execute(
                 """
-                SELECT id, name, source_ref, platform, matched_bili_uid, matched_weibo_uid 
+                SELECT id, name, source_ref, platform, matched_bili_uid, matched_weibo_uid, status, status_updated_at
                 FROM coser_candidates 
-                WHERE status = 'pending' AND is_verified = 0;
+                WHERE (status = 'pending' AND is_verified = 0) OR (status = 'undetermined' AND is_verified = 0 AND datetime(status_updated_at) <= datetime('now', '-7 days', '+8 hours'))
+                ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, status_updated_at DESC;
                 """
             )
             rows = cursor.fetchall()
-            candidates_to_verify = [
-                {
-                    "id": r[0],
-                    "name": r[1],
-                    "source_ref": r[2],
-                    "platform": r[3],
-                    "matched_bili_uid": r[4],
-                    "matched_weibo_uid": r[5]
-                }
-                for r in rows
-            ]
+            
+            candidates_to_verify = []
+            for r in rows:
+                cand_id = r[0]
+                name = r[1]
+                source_ref = r[2]
+                platform = r[3]
+                matched_bili_uid = r[4]
+                matched_weibo_uid = r[5]
+                status = r[6]
+                status_updated_at_str = r[7]
+                
+                candidates_to_verify.append({
+                    "id": cand_id,
+                    "name": name,
+                    "source_ref": source_ref,
+                    "platform": platform,
+                    "matched_bili_uid": matched_bili_uid,
+                    "matched_weibo_uid": matched_weibo_uid,
+                    "status": status,
+                    "status_updated_at": status_updated_at_str
+                })
         finally:
             cursor.close()
             conn.close()
@@ -161,14 +194,27 @@ class DiscoveryService:
         candidates_to_run = candidates_to_verify[:process_limit]
         print(f"\x1b[1;36m[Discovery] 缓冲队列中共有 {len(candidates_to_verify)} 个待验证候选人，本轮处理前 {len(candidates_to_run)} 个\x1b[0m")
 
-        # 预先进行微博来源候选人的批量解析与缓存
+        # 预先进行微博来源及交叉候选人的批量解析与缓存
         from src.tools.weibo_scraper import WeiboScraper
         weibo_scraper = WeiboScraper()
         
-        weibo_names = [cand["name"] for cand in candidates_to_run if cand["platform"] == "weibo"]
+        weibo_names = [cand["name"] for cand in candidates_to_run]
         resolved_weibo_users = {}
         if weibo_names:
             resolved_weibo_users = await weibo_scraper.resolve_screen_names_batch(weibo_names)
+            
+        # 收集本轮中已有已绑定 weibo_uid 的候选人，批量解析其 Profile
+        weibo_uids_to_resolve = [
+            str(cand["matched_weibo_uid"]) 
+            for cand in candidates_to_run 
+            if cand.get("matched_weibo_uid") and str(cand["matched_weibo_uid"]).strip()
+        ]
+        resolved_weibo_users_by_uid = {}
+        if weibo_uids_to_resolve:
+            try:
+                resolved_weibo_users_by_uid = await weibo_scraper.resolve_uids_batch(weibo_uids_to_resolve)
+            except Exception as e:
+                log_event("ERROR", "DiscoveryService", f"通过 UID 批量解析微博 Profile 失败: {e}", str(e))
         
         weibo_info_map = {}
         
@@ -180,23 +226,29 @@ class DiscoveryService:
             name = cand["name"]
             platform = cand["platform"]
             
-            # 1. Weibo attributes caching
+            # 1. Weibo attributes caching (Double-sided cross-verification)
             weibo_uid = cand.get("matched_weibo_uid")
             weibo_bio = ""
-            is_coser_by_weibo_bio = False
+            weibo_verify = ""
             
-            if platform == "weibo":
+            # 优先从已绑定 UID 解析的微博用户信息中匹配属性
+            weibo_user = None
+            if weibo_uid and str(weibo_uid).strip():
+                weibo_user = resolved_weibo_users_by_uid.get(str(weibo_uid))
+            
+            # 如果没有，降级使用同名匹配到的用户信息
+            if not weibo_user:
                 weibo_user = resolved_weibo_users.get(name)
-                if weibo_user:
-                    weibo_uid = str(weibo_user.get("idstr") or weibo_uid or "")
-                    weibo_bio = weibo_user.get("description") or ""
-                    bio_lower = weibo_bio.lower()
-                    is_coser_by_weibo_bio = any(kw in bio_lower for kw in DiscoveryService.COSER_KEYWORDS)
+            
+            if weibo_user:
+                weibo_uid = str(weibo_user.get("idstr") or weibo_uid or "")
+                weibo_bio = weibo_user.get("description") or ""
+                weibo_verify = weibo_user.get("verified_reason") or ""
             
             weibo_info_map[cand_id] = {
                 "weibo_uid": weibo_uid,
                 "weibo_bio": weibo_bio,
-                "is_coser": is_coser_by_weibo_bio
+                "weibo_verify": weibo_verify
             }
             
             # 2. B站 search setup
@@ -263,24 +315,87 @@ class DiscoveryService:
                 log_event("ERROR", "DiscoveryService", f"批量解析 B站 空间失败: {e}", str(e))
                 resolved_profiles = {}
 
+        # 预先分析强弱匹配，用于自适应爬取及直接确权
+        strong_match_map = {}
+        weak_match_map = {}
+        for cand in candidates_to_run:
+            cand_id = cand["id"]
+            name = cand["name"]
+            platform = cand["platform"]
+            bili_uid = candidate_uids.get(cand_id)
+            
+            w_info = weibo_info_map.get(cand_id)
+            w_bio = w_info["weibo_bio"] if w_info else ""
+            w_verify = w_info["weibo_verify"] if w_info else ""
+            
+            profile = resolved_profiles.get(bili_uid) if bili_uid else None
+            b_bio = ""
+            b_verify = ""
+            if profile and (profile.get("bio") or profile.get("verify_desc")):
+                b_bio = profile.get("bio") or ""
+                b_verify = profile.get("verify_desc") or ""
+            else:
+                best_match = candidate_best_match.get(cand_id)
+                if best_match:
+                    search_results = candidate_search_results.get(cand_id, [])
+                    original_result = next((item for item in search_results if str(item.get("mid")) == str(bili_uid)), None)
+                    b_bio = (original_result.get("usign") or "") if original_result else ""
+                    b_verify = best_match.get("verify_desc") or ""
+            
+            strong_matched = (
+                DiscoveryService.has_strong_match(name) or
+                DiscoveryService.has_strong_match(w_bio) or 
+                DiscoveryService.has_strong_match(w_verify) or 
+                DiscoveryService.has_strong_match(b_bio) or 
+                DiscoveryService.has_strong_match(b_verify)
+            )
+            
+            name_lower = name.lower()
+            name_has_cos = False
+            if "cos" in name_lower:
+                exclude_words = ["costco", "cosme", "cosmos", "constantine", "cosco", "cosmect", "cosmetic"]
+                if not any(ew in name_lower for ew in exclude_words):
+                    is_valid_cos = (
+                        "coser" in name_lower or
+                        "cosplay" in name_lower or
+                        re.search(r'(?:^|[^a-zA-Z])cos(?:$|[^a-zA-Z])', name_lower) is not None
+                    )
+                    if is_valid_cos:
+                        name_has_cos = True
+                        
+            bio_has_weak = (
+                DiscoveryService.has_weak_match(w_bio) or 
+                DiscoveryService.has_weak_match(w_verify) or 
+                DiscoveryService.has_weak_match(b_bio) or 
+                DiscoveryService.has_weak_match(b_verify)
+            )
+            
+            strong_match_map[cand_id] = strong_matched
+            weak_match_map[cand_id] = name_has_cos or bio_has_weak
+
         # 物理隔离并发爬取候选人博文逻辑并保存至 candidate_raw_posts
         failed_crawl_cand_ids = set()
 
         async def fetch_and_save_single_candidate(cand):
             cand_id = cand["id"]
+            if strong_match_map.get(cand_id, False):
+                return
+                
             cand_platform = cand["platform"]
             bili_uid = candidate_uids.get(cand_id)
             w_info = weibo_info_map.get(cand_id)
             weibo_uid = w_info["weibo_uid"] if w_info else None
             
+            is_weak = weak_match_map.get(cand_id, False)
+            limit = 10 if is_weak else 3
+            
             posts_fetched = []
             try:
                 if cand_platform == "bilibili" and bili_uid:
-                    posts_fetched = await scraper.fetch_bilibili_posts(bili_uid, limit=3)
+                    posts_fetched = await scraper.fetch_bilibili_posts(bili_uid, limit=limit)
                 elif cand_platform == "weibo" and weibo_uid:
-                    posts_fetched = await weibo_scraper.fetch_weibo_posts(weibo_uid, limit=3)
+                    posts_fetched = await weibo_scraper.fetch_weibo_posts(weibo_uid, limit=limit)
                 
-                # 过滤虚拟 Bio 动态，只将真实的博文写入候选人博文表
                 real_posts = [p for p in posts_fetched if not p["post_id"].startswith("bio_")]
                 if real_posts:
                     DBService.save_candidate_raw_posts(cand_id, cand_platform, real_posts)
@@ -299,11 +414,8 @@ class DiscoveryService:
             name = cand["name"]
             
             w_info = weibo_info_map.get(cand_id)
-            is_coser_by_weibo_bio = w_info["is_coser"] if w_info else False
             weibo_uid = w_info["weibo_uid"] if w_info else None
-
             bili_uid = candidate_uids.get(cand_id)
-            profile = resolved_profiles.get(bili_uid) if bili_uid else None
 
             # 0. 检测是否已在正式追踪列表中 (Prevent duplicate tracking)
             is_already_tracked = (
@@ -318,33 +430,8 @@ class DiscoveryService:
                     "weibo_uid": weibo_uid
                 }
 
-            is_coser_by_name = False
-            is_coser_by_bili_bio = False
-            is_bili_verified_type = False
-            
-            name_lower = name.lower()
-            is_coser_by_name = "cos" in name_lower or "coser" in name_lower or "cosplay" in name_lower
-
-            if profile:
-                bili_bio = (profile.get("bio") or "").lower()
-                bili_verify = (profile.get("verify_desc") or "").lower()
-                is_coser_by_bili_bio = any(kw in bili_bio for kw in DiscoveryService.COSER_KEYWORDS) or any(kw in bili_verify for kw in DiscoveryService.COSER_KEYWORDS)
-                is_bili_verified_type = len(bili_verify) > 0 and any(kw in bili_verify for kw in DiscoveryService.COSER_KEYWORDS)
-            else:
-                best_match = candidate_best_match.get(cand_id)
-                if best_match:
-                    search_results = candidate_search_results.get(cand_id, [])
-                    original_result = next((item for item in search_results if str(item.get("mid")) == str(bili_uid)), None)
-                    usign = (original_result.get("usign") or "") if original_result else ""
-                    bio_lower = usign.lower()
-                    verify_lower = (best_match.get("verify_desc") or "").lower()
-                    
-                    is_coser_by_bili_bio = any(kw in bio_lower for kw in DiscoveryService.COSER_KEYWORDS) or any(kw in verify_lower for kw in DiscoveryService.COSER_KEYWORDS)
-                    is_bili_verified_type = best_match.get("scores", {}).get("verify", 0.0) > 0.0
-
-            # 1. 优先使用 Bio 二次元关键词匹配作为验证手段 (Bio-First)
-            is_bio_eligible = is_coser_by_weibo_bio or is_coser_by_name or is_coser_by_bili_bio or is_bili_verified_type
-            if is_bio_eligible:
+            # 1. 强匹配直接确权通过，不调用 LLM 及博文抓取
+            if strong_match_map.get(cand_id, False):
                 return {
                     "cand": cand,
                     "action": "approve",
@@ -353,12 +440,12 @@ class DiscoveryService:
                     "weibo_uid": weibo_uid
                 }
 
-            # 2. 如果 Bio 不满足，则查询已抓取的隔离博文
+            # 2. 如果 Bio 不满足强匹配，则查询已抓取的隔离博文
             conn = get_db_connection()
             cursor = conn.cursor()
             try:
                 cursor.execute(
-                    "SELECT platform, content, published_at FROM candidate_raw_posts WHERE candidate_id = ? ORDER BY id DESC LIMIT 5;",
+                    "SELECT platform, content, published_at FROM candidate_raw_posts WHERE candidate_id = ? ORDER BY id DESC LIMIT 10;",
                     (cand_id,)
                 )
                 p_rows = cursor.fetchall()
@@ -384,11 +471,19 @@ class DiscoveryService:
                             "weibo_uid": weibo_uid
                         }
                     else:
-                        return {
-                            "cand": cand,
-                            "action": "reject",
-                            "reject_reason": "LLM_VERIFY_FAILED_HAS_RUN"
-                        }
+                        confidence = llm_res.get("confidence", 1.0)
+                        if confidence >= 0.8:
+                            return {
+                                "cand": cand,
+                                "action": "reject",
+                                "reject_reason": "LLM_VERIFY_FAILED_HAS_RUN"
+                            }
+                        else:
+                            return {
+                                "cand": cand,
+                                "action": "set_undetermined",
+                                "reason": f"[LLM Low Confidence {confidence}] {llm_reason}"
+                            }
                 except Exception as e:
                     # 发生暂时性 LLM 异常，返回待处理状态
                     log_event("WARNING", "DiscoveryService", f"候选人 [{name}] 智能体核验发生暂时性异常: {e}", str(e))
@@ -400,21 +495,27 @@ class DiscoveryService:
 
             # 4. 如果没有博文数据，检查是否因为爬取时发生异常
             if cand_id in failed_crawl_cand_ids:
-                # 爬取时异常，可能是临时网络/爬行被拦截，保持 pending 状态以便重试
                 return {
                     "cand": cand,
                     "action": "keep_pending",
                     "reason": "博文抓取异常"
                 }
 
-            # 5. 没有博文数据且爬取没有发生异常（确实无博文且 Bio 也不符合），则判定为非 Coser 忽略
+            # 5. 没有博文数据且爬取没有发生异常，判定为非 Coser 忽略
             return {
                 "cand": cand,
                 "action": "reject",
                 "reject_reason": "NO_POSTS_AND_BIO_FAILED"
             }
 
-        eval_tasks = [evaluate_single_candidate(cand) for cand in candidates_to_run]
+        # 引入 Semaphore 限频大模型请求 (Semaphore concurrency limit of 5)
+        sem = asyncio.Semaphore(5)
+
+        async def evaluate_single_candidate_with_sem(cand):
+            async with sem:
+                return await evaluate_single_candidate(cand)
+
+        eval_tasks = [evaluate_single_candidate_with_sem(cand) for cand in candidates_to_run]
         eval_results = []
         if eval_tasks:
             eval_results = await asyncio.gather(*eval_tasks)
@@ -442,10 +543,12 @@ class DiscoveryService:
                     verify_reason=verify_reason
                 )
                 if success:
+                    # 自动核验自动通过 (Auto-Promotion) 并物理清理临时博文
+                    DBService.approve_candidate(cand_id)
                     newly_verified += 1
                     bili_info = f" -> B站(UID: {bili_uid})" if bili_uid else ""
                     weibo_info = f" -> 微博(UID: {weibo_uid})" if weibo_uid else ""
-                    print(f"\x1b[1;32m[Discovery] ✓ 成功验证候选人 [{name}]{bili_info}{weibo_info} | 原因: {verify_reason} | 置信度: {candidate_bili_scores.get(cand_id, 0.0):.1f}\x1b[0m")
+                    print(f"\x1b[1;32m[Discovery] ✓ 成功自动验证并批准候选人 [{name}]{bili_info}{weibo_info} | 原因: {verify_reason} | 置信度: {candidate_bili_scores.get(cand_id, 0.0):.1f}\x1b[0m")
             elif action == "reject":
                 reject_reason = res["reject_reason"]
                 bili_uid = candidate_uids.get(cand_id)
@@ -459,6 +562,9 @@ class DiscoveryService:
                 else:
                     print(f"\x1b[1;33m[Discovery] ⚠ 候选人 [{name}] 未通过二次元属性及相似度校验，自动置为忽略。\x1b[0m")
                 DBService.reject_candidate(cand_id)
+            elif action == "set_undetermined":
+                print(f"\x1b[1;33m[Discovery] ⚠ 候选人 [{name}] 置信度较低，暂时标记为待定（undetermined）: {res['reason']}\x1b[0m")
+                DBService.set_candidate_undetermined(cand_id)
             elif action == "keep_pending":
                 print(f"\x1b[1;33m[Discovery] ⚠ 候选人 [{name}] 核验流程不完整（{res['reason']}），保留 pending 状态以供下次重试。\x1b[0m")
 

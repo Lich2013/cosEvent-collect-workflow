@@ -39,6 +39,15 @@ class Settings:
         # 极简泛称黑名单默认值
         self.bypass_generic_names = ["签售", "一日店长", "店长", "摄影会", "受邀模特", "快闪", "签售会"]
         
+        # 默认强弱特征词配置
+        self.coser_keywords = {
+            "strong": ["cosplay", "coser", "排班", "嘉宾", "发片"],
+            "weak": [
+                "cos", "二次元", "工作", "合作", "店长", "签售", "模特", 
+                "写真", "博主", "次元", "主页", "摄影", "后期", "妆造", "画师"
+            ]
+        }
+        
         # 默认多供应商及流水线配置
         self.llm_providers = {
             "openai": {
@@ -73,6 +82,7 @@ class Settings:
                         
                         self.custom_cities = data.get("custom_cities", [])
                         self.bypass_generic_names = data.get("bypass_generic_names", self.bypass_generic_names)
+                        self.coser_keywords = data.get("coser_keywords", self.coser_keywords)
                         
                         bili_grpc = data.get("bilibili_grpc", {}) or {}
                         self.bilibili_grpc_access_token = bili_grpc.get("access_token", "")

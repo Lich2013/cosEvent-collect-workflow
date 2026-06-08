@@ -83,7 +83,7 @@ async def test_verify_pending_candidates_bypass_search():
         mock_resolve.assert_called_once_with(["987654321"])
         
         # 检查候选人是否被成功标记为 verified=1 且 UID 保持不变
-        candidates = DBService.list_candidates("pending")
+        candidates = DBService.list_candidates("approved")
         assert len(candidates) == 1
         cand = candidates[0]
         assert cand["matched_bili_uid"] == "987654321"
@@ -143,7 +143,7 @@ async def test_verify_pending_candidates_combined_validation():
         assert verified_count == 1
         
         # 校验数据库更新
-        candidates = DBService.list_candidates("pending")
+        candidates = DBService.list_candidates("approved")
         assert len(candidates) == 1
         cand = candidates[0]
         assert cand["matched_weibo_uid"] == "222333"

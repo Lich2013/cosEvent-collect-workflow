@@ -174,11 +174,11 @@ async def test_discovery_service_integration():
         assert inserted_count == 1
 
         # 检查是否成功验证，且 UID 和分数写入正确
-        pending = DBService.list_candidates("pending")
-        assert len(pending) == 1
-        assert pending[0]["name"] == "小红帽_cos"
-        assert pending[0]["matched_bili_uid"] == "999888"
-        assert pending[0]["match_score"] > 0.0
+        approved = DBService.list_candidates("approved")
+        assert len(approved) == 1
+        assert approved[0]["name"] == "小红帽_cos"
+        assert approved[0]["matched_bili_uid"] == "999888"
+        assert approved[0]["match_score"] > 0.0
 
 @pytest.mark.asyncio
 async def test_candidate_post_verification_llm_flow():
@@ -217,22 +217,20 @@ async def test_candidate_post_verification_llm_flow():
         verified_count = await DiscoveryService.verify_pending_candidates(limit=5)
         assert verified_count == 1
         
-        # 3. 验证数据库中候选人的状态被更新为 is_verified = 1 且带有 verify_reason
-        pending_after = DBService.list_candidates("pending")
-        assert len(pending_after) == 1
-        cand_after = pending_after[0]
+        # 3. 验证数据库中候选人的状态被更新为 approved
+        approved_after = DBService.list_candidates("approved")
+        assert len(approved_after) == 1
+        cand_after = approved_after[0]
         assert cand_after["is_verified"] == 1
         assert "[LLM]" in cand_after["verify_reason"]
         assert "博文中含有漫展返图及一日店长排班信息" in cand_after["verify_reason"]
         
-        # 4. 验证博文已物理隔离保存到 candidate_raw_posts 中
+        # 4. 验证博文在自动核验批准后，已被自动从 candidate_raw_posts 中物理清理
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT content FROM candidate_raw_posts WHERE candidate_id = ? ORDER BY id ASC;", (cand_id,))
         rows = cursor.fetchall()
-        assert len(rows) == 2
-        assert rows[0][0] == "今天CP30第一天芙宁娜返图，欢迎来摊位找我！"
-        assert rows[1][0] == "下周六一日店长排班表出来啦！"
+        assert len(rows) == 0
         cursor.close()
         conn.close()
 
@@ -273,3 +271,290 @@ async def test_candidate_post_verification_llm_negative_flow():
         ignored = DBService.list_candidates("ignored")
         assert len(ignored) == 1
         assert ignored[0]["id"] == cand_id
+
+
+def test_database_shadow_table_migration(tmp_path):
+    """测试 coser_candidates 的影子表重构热迁移，CHECK 约束升级及数据无损"""
+    db_file = tmp_path / "test_migration.db"
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    # 1. 创建旧版表（仅支持 pending, approved, ignored）
+    cursor.execute("""
+    CREATE TABLE coser_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        platform TEXT NOT NULL,
+        source_ref TEXT,
+        matched_bili_uid TEXT,
+        matched_weibo_uid TEXT,
+        matched_xhs_uid TEXT,
+        match_score REAL DEFAULT 0.0,
+        status TEXT DEFAULT 'pending',
+        is_verified INTEGER DEFAULT 0,
+        verify_reason TEXT,
+        created_at TEXT,
+        CHECK (status IN ('pending', 'approved', 'ignored'))
+    );
+    """)
+    # 2. 插入测试数据
+    cursor.execute("""
+    INSERT INTO coser_candidates (name, platform, status, is_verified) 
+    VALUES ('旧用户1', 'weibo', 'pending', 0), ('旧用户2', 'bilibili', 'approved', 1);
+    """)
+    conn.commit()
+    conn.close()
+
+    # 3. 运行 init_db 触发升级
+    settings.db_path = str(db_file)
+    init_db()
+
+    # 4. 验证数据无损及新约束生效
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, status, is_verified FROM coser_candidates ORDER BY id ASC;")
+    rows = cursor.fetchall()
+    assert len(rows) == 2
+    assert rows[0] == ('旧用户1', 'pending', 0)
+    assert rows[1] == ('旧用户2', 'approved', 1)
+
+    # 5. 测试插入 'undetermined'，应当成功
+    try:
+        cursor.execute("""
+        INSERT INTO coser_candidates (name, platform, status, is_verified) 
+        VALUES ('新待定用户', 'weibo', 'undetermined', 0);
+        """)
+        conn.commit()
+    except Exception as e:
+        pytest.fail(f"插入 undetermined 状态失败: {e}")
+
+    # 6. 测试插入非法状态，应当被 CHECK 约束拒绝
+    with pytest.raises(sqlite3.IntegrityError):
+        cursor.execute("""
+        INSERT INTO coser_candidates (name, platform, status, is_verified) 
+        VALUES ('非法用户', 'weibo', 'invalid_status', 0);
+        """)
+        conn.commit()
+
+    conn.close()
+    if db_file.exists():
+        db_file.unlink()
+
+
+@pytest.mark.asyncio
+async def test_candidate_strong_bio_match_bypass():
+    """测试 Bio 强词匹配直接验证通过，绕过爬取和 LLM"""
+    # B站官方认证命中强词 "知名Coser"
+    CandidateRepository.add_candidate(
+        name="强词测试Coser",
+        platform="bilibili",
+        matched_bili_uid="111222"
+    )
+
+    mock_profile = {
+        "bio": "普通简介",
+        "verify_desc": "知名Coser"
+    }
+
+    with patch("src.tools.bilibili_scraper.BilibiliScraper.resolve_uids_batch", new_callable=AsyncMock) as mock_resolve, \
+         patch("src.tools.bilibili_scraper.BilibiliScraper.fetch_bilibili_posts", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+         
+        mock_resolve.return_value = {"111222": mock_profile}
+        
+        verified_count = await DiscoveryService.verify_pending_candidates(limit=5)
+        assert verified_count == 1
+
+        # 验证没有调用 LLM 和博文抓取
+        mock_fetch.assert_not_called()
+        mock_llm.assert_not_called()
+
+        # 检查是否成功标记通过且原因为 "Bio 关键词匹配成功"
+        approved = DBService.list_candidates("approved")
+        assert len(approved) == 1
+        assert approved[0]["is_verified"] == 1
+        assert approved[0]["verify_reason"] == "Bio 关键词匹配成功"
+
+
+@pytest.mark.asyncio
+async def test_adaptive_crawling_limit_and_undetermined():
+    """测试弱词下自适应抓取 limit=10 与低置信度下的 undetermined 软状态及博文清理"""
+    # 名字含 cos 作为弱特征
+    CandidateRepository.add_candidate(
+        name="弱特征cos博主",
+        platform="weibo",
+        matched_weibo_uid="333444"
+    )
+
+    # 普通无特征博主
+    CandidateRepository.add_candidate(
+        name="普通路人博主",
+        platform="weibo",
+        matched_weibo_uid="555666"
+    )
+
+    mock_weibo_user_1 = {"idstr": "333444", "description": "日常分享"}
+    mock_weibo_user_2 = {"idstr": "555666", "description": "分享美食与日常生活"}
+
+    mock_posts = [
+        {"post_id": "1", "content": "日常发博", "post_url": "http://weibo.com/1", "published_at": "2026-06-06 12:00:00"}
+    ]
+
+    # 模拟第一个弱特征博主 LLM 判定为 False 且低置信度 -> undetermined
+    mock_llm_res_1 = {
+        "is_active_coser": False,
+        "confidence": 0.65,
+        "reason": "博文暂无明确证据"
+    }
+
+    # 模拟第二个普通博主 LLM 判定为 False 且高置信度 -> ignored
+    mock_llm_res_2 = {
+        "is_active_coser": False,
+        "confidence": 0.95,
+        "reason": "确定是纯美食生活账号"
+    }
+
+    with patch("src.tools.weibo_scraper.WeiboScraper.resolve_screen_names_batch", new_callable=AsyncMock) as mock_resolve_names, \
+         patch("src.tools.weibo_scraper.WeiboScraper.fetch_weibo_posts", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+         
+        mock_resolve_names.return_value = {
+            "弱特征cos博主": mock_weibo_user_1,
+            "普通路人博主": mock_weibo_user_2
+        }
+        mock_fetch.return_value = mock_posts
+        
+        # 依次为两个候选人做 LLM 结果的侧写
+        mock_llm.side_effect = [mock_llm_res_1, mock_llm_res_2]
+
+        await DiscoveryService.verify_pending_candidates(limit=5)
+
+        # 检查 fetch 调用的 limit 参数是否自适应：
+        # 第一个弱特征：limit=10，第二个普通：limit=3
+        fetch_calls = mock_fetch.call_args_list
+        assert len(fetch_calls) == 2
+        # weibo_uid 333444 的 limit 应为 10
+        assert fetch_calls[0][0][0] == "333444"
+        assert fetch_calls[0][1]["limit"] == 10
+        # weibo_uid 555666 的 limit 应为 3
+        assert fetch_calls[1][0][0] == "555666"
+        assert fetch_calls[1][1]["limit"] == 3
+
+        # 检查数据库状态流转
+        # 弱特征博主由于低置信度，状态更新为 undetermined
+        undetermined_list = CandidateRepository.list_candidates("undetermined")
+        assert len(undetermined_list) == 1
+        assert undetermined_list[0]["name"] == "弱特征cos博主"
+        assert undetermined_list[0]["is_verified"] == 0
+
+        # 普通博主由于高置信度，状态更新为 ignored
+        ignored_list = CandidateRepository.list_candidates("ignored")
+        assert len(ignored_list) == 1
+        assert ignored_list[0]["name"] == "普通路人博主"
+
+        # 验证两者的临时博文在 candidate_raw_posts 中均已被物理清理
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM candidate_raw_posts;")
+        count = cursor.fetchone()[0]
+        assert count == 0
+        cursor.close()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_priority_queue_and_cooldown_filter():
+    """测试验证队列中 undetermined 的 7 天冷却期以及 pending 优先级的 SQL 排序"""
+    beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+    now = datetime.datetime.now(beijing_tz)
+
+    # 1. 插入四种测试候选人
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # 候选人A: undetermined 且冷却未过（3天前创建）
+    three_days_ago = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    INSERT INTO coser_candidates (name, platform, status, status_updated_at, created_at, is_verified) 
+    VALUES ('待定冷却中Coser', 'weibo', 'undetermined', ?, ?, 0);
+    """, (three_days_ago, three_days_ago))
+
+    # 候选人B: undetermined 且冷却已过（8天前创建）
+    eight_days_ago = (now - datetime.timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    INSERT INTO coser_candidates (name, platform, status, status_updated_at, created_at, is_verified) 
+    VALUES ('待定已过期Coser', 'weibo', 'undetermined', ?, ?, 0);
+    """, (eight_days_ago, eight_days_ago))
+
+    # 候选人C: 全新录入的 pending
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    INSERT INTO coser_candidates (name, platform, status, status_updated_at, created_at, is_verified) 
+    VALUES ('全新Pending博主', 'weibo', 'pending', ?, ?, 0);
+    """, (now_str, now_str))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    # 2. 调用真实的 verify_pending_candidates 并通过 Mock 捕获其捞取和排序结果
+    with patch("src.tools.weibo_scraper.WeiboScraper.resolve_screen_names_batch", new_callable=AsyncMock) as mock_resolve, \
+         patch("src.tools.weibo_scraper.WeiboScraper.fetch_weibo_posts", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+         
+        mock_resolve.return_value = {}
+        mock_fetch.return_value = []
+        mock_llm.return_value = {"is_active_coser": False, "confidence": 0.9}
+        
+        await DiscoveryService.verify_pending_candidates(limit=5)
+
+        # 3. 验证过滤结果与优先级排序：
+        # mock_resolve 的 call 参数应该包含且仅包含 "全新Pending博主" 和 "待定已过期Coser"，
+        # 且 "全新Pending博主" (pending) 排序优先于 "待定已过期Coser" (undetermined)。
+        # "待定冷却中Coser" (在7天冷却期内) 绝不应该被捞出解析。
+        assert mock_resolve.called
+        called_names = mock_resolve.call_args[0][0]
+        assert len(called_names) == 2
+        assert called_names[0] == "全新Pending博主"
+        assert called_names[1] == "待定已过期Coser"
+
+
+@pytest.mark.asyncio
+async def test_discovery_weibo_uid_cross_verification():
+    """测试 B站 来源候选人如果绑定了 weibo_uid，可以通过该 UID 反向解析其微博 profile 进行交叉核验"""
+    CandidateRepository.add_candidate(
+        name="反向交叉测试Coser",
+        platform="bilibili",
+        matched_bili_uid="111",
+        matched_weibo_uid="888"
+    )
+
+    mock_weibo_profile = {
+        "idstr": "888",
+        "screen_name": "微博小号",
+        "description": "二次元排班嘉宾Coser" # 微博命中强词
+    }
+    
+    mock_bili_profile = {
+        "bio": "普通非Coser日常",
+        "verify_desc": ""
+    }
+
+    with patch("src.tools.weibo_scraper.WeiboScraper.resolve_uids_batch", new_callable=AsyncMock) as mock_weibo_uid_resolve, \
+         patch("src.tools.bilibili_scraper.BilibiliScraper.resolve_uids_batch", new_callable=AsyncMock) as mock_bili_uid_resolve, \
+         patch("src.tools.bilibili_scraper.BilibiliScraper.fetch_bilibili_posts", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+         
+        mock_weibo_uid_resolve.return_value = {"888": mock_weibo_profile}
+        mock_bili_uid_resolve.return_value = {"111": mock_bili_profile}
+
+        verified_count = await DiscoveryService.verify_pending_candidates(limit=5)
+        assert verified_count == 1
+        
+        # 强匹配通过直接确权，不应该调用博文爬取和大模型
+        mock_fetch.assert_not_called()
+        mock_llm.assert_not_called()
+
+        approved = DBService.list_candidates("approved")
+        assert len(approved) == 1
+        assert approved[0]["name"] == "反向交叉测试Coser"
+        assert approved[0]["is_verified"] == 1
+        assert approved[0]["verify_reason"] == "Bio 关键词匹配成功"
+

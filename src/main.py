@@ -193,9 +193,9 @@ def sync_bili_command(limit, dry_run):
     TerminalRenderer.render_sync_bili_report(report)
 
 @coser.command("list-candidates")
-@click.option("--status", default="pending", type=click.Choice(["pending", "approved", "ignored"]), help="按状态过滤候选人列表，默认 pending")
+@click.option("--status", default="pending", type=click.Choice(["pending", "approved", "ignored", "undetermined"]), help="按状态过滤候选人列表，默认 pending")
 def list_candidates_command(status):
-    """[Coser Candidates] 查看自动发现的 Coser 候选记录"""
+    """[Coser Candidates] 查看自动发现 of Coser 候选记录"""
     init_db()
     candidates = DBService.list_candidates(status)
     click.echo(f"\n--- {status.upper()} Coser 候选人列表 (共 {len(candidates)} 人) ---")
@@ -209,7 +209,7 @@ def approve_candidate_command(candidate_id):
     if DBService.approve_candidate(candidate_id):
         click.secho(f"✓ 成功批准候选人 ID [{candidate_id}] 并导入正式 Coser 列表！", fg="green", bold=True)
     else:
-        click.secho(f"✗ 批准候选人 ID [{candidate_id}] 失败，请检查 ID 是否正确且状态是否为 pending。", fg="red", bold=True)
+        click.secho(f"✗ 批准候选人 ID [{candidate_id}] 失败，请检查 ID 是否正确且状态是否为 pending 或 undetermined。", fg="red", bold=True)
 
 @coser.command("reject-candidate")
 @click.option("--id", "candidate_id", type=int, required=True, help="要忽略/拒绝的候选人 ID")
@@ -219,7 +219,7 @@ def reject_candidate_command(candidate_id):
     if DBService.reject_candidate(candidate_id):
         click.secho(f"✓ 成功忽略候选人 ID [{candidate_id}]！", fg="yellow", bold=True)
     else:
-        click.secho(f"✗ 忽略候选人 ID [{candidate_id}] 失败，请检查 ID 是否正确且状态是否为 pending。", fg="red", bold=True)
+        click.secho(f"✗ 忽略候选人 ID [{candidate_id}] 失败，请检查 ID 是否正确且状态是否为 pending 或 undetermined。", fg="red", bold=True)
 
 @coser.command("discover")
 @click.option("--limit", default=15, type=int, help="本次最多检索/验证新候选人的名额上限，默认 15")

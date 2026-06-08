@@ -63,6 +63,11 @@ class DBService:
         return CandidateRepository.reject_candidate(candidate_id)
 
     @staticmethod
+    def set_candidate_undetermined(candidate_id: int) -> bool:
+        return CandidateRepository.set_candidate_undetermined(candidate_id)
+
+
+    @staticmethod
     def save_candidate_raw_posts(candidate_id: int, platform: str, posts: list[dict]) -> int:
         return CandidateRepository.save_candidate_raw_posts(candidate_id, platform, posts)
 
