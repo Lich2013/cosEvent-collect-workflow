@@ -753,16 +753,15 @@ class BilibiliScraper(BaseScraper):
                     "csrf": ""
                 }
                 
-                # 修复 POST 参：以标准的 application/x-www-form-urlencoded 体形式发送
-                data = urllib.parse.urlencode(params).encode("utf-8")
+                # 将参数拼接在 URL Query String 中发送，POST Body (data) 保持为空
+                query_string = urllib.parse.urlencode(params)
+                full_url = f"{url}?{query_string}"
                 
                 req = urllib.request.Request(
-                    url,
-                    data=data,
+                    full_url,
                     method="POST",
                     headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Content-Type": "application/x-www-form-urlencoded"
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                     }
                 )
                 
@@ -988,8 +987,12 @@ class BilibiliScraper(BaseScraper):
             target_url = f"https://search.bilibili.com/upuser?keyword={urllib.parse.quote(str(keyword))}"
             
             try:
-                # 直接导航，等待网络空闲以加载 SSR 数据
-                await page.goto(target_url, wait_until="networkidle", timeout=12000)
+                # 避开 networkidle，使用 domcontentloaded 并等待关键元素以防止加载超时
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=12000)
+                try:
+                    await page.wait_for_selector(".b-user-info-card, .up-item, .user-item", timeout=5000)
+                except Exception:
+                    pass
                 
                 # 兼容性选择：定位用户卡片容器 (优先新版, 其次旧版)
                 up_items = await page.query_selector_all(".b-user-info-card")
@@ -1131,7 +1134,12 @@ class BilibiliScraper(BaseScraper):
                 target_url = f"https://search.bilibili.com/upuser?keyword={urllib.parse.quote(str(kw))}"
                 
                 try:
-                    await page.goto(target_url, wait_until="networkidle", timeout=12000)
+                    # 避开 networkidle，使用 domcontentloaded 并等待关键元素以防止加载超时
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=12000)
+                    try:
+                        await page.wait_for_selector(".b-user-info-card, .up-item, .user-item", timeout=5000)
+                    except Exception:
+                        pass
                     
                     up_items = await page.query_selector_all(".b-user-info-card")
                     if not up_items:
@@ -1289,8 +1297,12 @@ class BilibiliScraper(BaseScraper):
                 
                 target_url = f"https://space.bilibili.com/{uid}"
                 try:
-                    await page.goto(target_url, wait_until="networkidle", timeout=12000)
-                    await asyncio.sleep(0.5)
+                    # 避开 networkidle，使用 domcontentloaded 并等待关键元素以防止加载超时
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=12000)
+                    try:
+                        await page.wait_for_selector(".h-sign, .h-name, #space-personal-card", timeout=5000)
+                    except Exception:
+                        await asyncio.sleep(0.5)
                 except Exception as e:
                     print(f"\x1b[1;33m[Scraper Warning] [bilibili] 访问空间 {uid} 页面加载失败/超时: {e}\x1b[0m")
                     

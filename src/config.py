@@ -21,6 +21,7 @@ class Settings:
         self.default_limit = 10
         self.page_load_timeout_seconds = 15
         self.analyze_confidence_threshold = 0.3
+        self.auto_approve_candidates = True
         self.langfuse_host = "http://localhost:3000"
         
         # Bilibili gRPC 凭证默认值
@@ -76,6 +77,7 @@ class Settings:
                         self.default_limit = int(data.get("default_limit", self.default_limit))
                         self.page_load_timeout_seconds = int(data.get("page_load_timeout_seconds", self.page_load_timeout_seconds))
                         self.analyze_confidence_threshold = float(data.get("analyze_confidence_threshold", self.analyze_confidence_threshold))
+                        self.auto_approve_candidates = bool(data.get("auto_approve_candidates", self.auto_approve_candidates))
                         self.langfuse_host = data.get("langfuse_host", self.langfuse_host)
                         self.llm_providers = data.get("llm_providers", self.llm_providers)
                         self.analysis_pipeline = data.get("analysis_pipeline", self.analysis_pipeline)

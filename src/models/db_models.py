@@ -192,9 +192,9 @@ def init_db():
         row = cursor.fetchone()
         if row:
             old_sql = row[0] or ""
-            # 检测旧版本的唯一约束 (去除空格以便匹配)
-            if "UNIQUE(platform,post_id)" in old_sql.replace(" ", ""):
-                print("\x1b[1;33m[Database Migration] 检测到旧版本的 candidate_raw_posts 唯一约束，准备重建该表以更新约束...\x1b[0m")
+            # 检测旧版本的唯一约束 (去除空格以便匹配) 或失效的外键引用
+            if "UNIQUE(platform,post_id)" in old_sql.replace(" ", "") or "coser_candidates_old" in old_sql:
+                print("\x1b[1;33m[Database Migration] 检测到旧版本或失效外键的 candidate_raw_posts，准备重建以修复外键约束...\x1b[0m")
                 cursor.execute("DROP TABLE candidate_raw_posts;")
 
         cursor.execute("""

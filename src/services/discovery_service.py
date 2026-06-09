@@ -41,7 +41,9 @@ class DiscoveryService:
         name = re.sub(r"_[a-zA-Z]+$", "", name)
         # 2. 匹配中文专属后缀，如 _cos, _Coser, _官博, _官方, _摄影 等
         name = re.sub(r"_(coser|cosplay|cos|摄影|后期|妆造|官博|官方|画师|bot)$", "", name, flags=re.IGNORECASE)
-        # 3. 剥离尾部的下划线
+        # 3. 剥离常见的微博/平台后置特征修饰词
+        name = re.sub(r"(的微博|的B站|的bili|的bilibili)$", "", name, flags=re.IGNORECASE)
+        # 4. 剥离尾部的下划线
         name = name.rstrip("_")
         return name
 
@@ -543,12 +545,18 @@ class DiscoveryService:
                     verify_reason=verify_reason
                 )
                 if success:
-                    # 自动核验自动通过 (Auto-Promotion) 并物理清理临时博文
-                    DBService.approve_candidate(cand_id)
-                    newly_verified += 1
-                    bili_info = f" -> B站(UID: {bili_uid})" if bili_uid else ""
-                    weibo_info = f" -> 微博(UID: {weibo_uid})" if weibo_uid else ""
-                    print(f"\x1b[1;32m[Discovery] ✓ 成功自动验证并批准候选人 [{name}]{bili_info}{weibo_info} | 原因: {verify_reason} | 置信度: {candidate_bili_scores.get(cand_id, 0.0):.1f}\x1b[0m")
+                    if settings.auto_approve_candidates:
+                        # 自动核验自动通过 (Auto-Promotion) 并物理清理临时博文
+                        DBService.approve_candidate(cand_id)
+                        newly_verified += 1
+                        bili_info = f" -> B站(UID: {bili_uid})" if bili_uid else ""
+                        weibo_info = f" -> 微博(UID: {weibo_uid})" if weibo_uid else ""
+                        print(f"\x1b[1;32m[Discovery] ✓ 成功自动验证并批准候选人 [{name}]{bili_info}{weibo_info} | 原因: {verify_reason} | 置信度: {candidate_bili_scores.get(cand_id, 0.0):.1f}\x1b[0m")
+                    else:
+                        newly_verified += 1
+                        bili_info = f" -> B站(UID: {bili_uid})" if bili_uid else ""
+                        weibo_info = f" -> 微博(UID: {weibo_uid})" if weibo_uid else ""
+                        print(f"\x1b[1;32m[Discovery] ✓ 成功核验候选人 [{name}]{bili_info}{weibo_info}，已记录核验状态与理由，待手动审批导入 | 原因: {verify_reason} | 置信度: {candidate_bili_scores.get(cand_id, 0.0):.1f}\x1b[0m")
             elif action == "reject":
                 reject_reason = res["reject_reason"]
                 bili_uid = candidate_uids.get(cand_id)

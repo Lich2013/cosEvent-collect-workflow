@@ -39,6 +39,17 @@ def test_extract_mentions():
     assert DiscoveryService.extract_mentions("") == []
     assert DiscoveryService.extract_mentions("普通碎碎念无艾特") == []
 
+def test_prune_weibo_suffix():
+    """测试 prune_weibo_suffix 函数对常见后缀的修剪功能"""
+    assert DiscoveryService.prune_weibo_suffix("我才不是阿澄的微博") == "我才不是阿澄"
+    assert DiscoveryService.prune_weibo_suffix("小明_coser") == "小明"
+    assert DiscoveryService.prune_weibo_suffix("某某_cosplay") == "某某"
+    assert DiscoveryService.prune_weibo_suffix("某某的B站") == "某某"
+    assert DiscoveryService.prune_weibo_suffix("某某的bili") == "某某"
+    assert DiscoveryService.prune_weibo_suffix("某某的bilibili") == "某某"
+    assert DiscoveryService.prune_weibo_suffix("纯良用户") == "纯良用户"
+    assert DiscoveryService.prune_weibo_suffix(None) == ""
+
 def test_candidate_repository_crud():
     """测试 CandidateRepository 候选人增删改查及流转"""
     name = "测试候选Coser"
@@ -557,4 +568,121 @@ async def test_discovery_weibo_uid_cross_verification():
         assert approved[0]["name"] == "反向交叉测试Coser"
         assert approved[0]["is_verified"] == 1
         assert approved[0]["verify_reason"] == "Bio 关键词匹配成功"
+
+
+@pytest.mark.asyncio
+async def test_candidate_verification_no_auto_approve():
+    """测试 settings.auto_approve_candidates = False 时，通过核验的候选人保留 pending 状态，不自动导入正式库，且不清理博文"""
+    # 启用手动把关，关闭自动审批
+    settings.auto_approve_candidates = False
+    try:
+        # 1. 注册两个候选人：一个强特征的 A，一个走 LLM 核验的 B
+        # 候选人 A (强特征)
+        CandidateRepository.add_candidate(
+            name="强特征未自动审批Coser",
+            platform="bilibili",
+            matched_bili_uid="999111"
+        )
+        # 候选人 B (普通特征)
+        CandidateRepository.add_candidate(
+            name="LLM未自动审批用户",
+            platform="bilibili",
+            matched_bili_uid="999222"
+        )
+        
+        mock_profile_a = {
+            "bio": "普通简介",
+            "verify_desc": "知名Coser" # 强特征词
+        }
+        mock_profile_b = {
+            "bio": "普通简介",
+            "verify_desc": ""
+        }
+        
+        mock_posts = [
+            {"post_id": "b_1", "content": "今天CP30第一天返图，芙宁娜赛高！", "post_url": "http://t.bilibili.com/b_1", "published_at": "2026-06-06 20:00:00"}
+        ]
+        
+        mock_llm_res = {
+            "is_active_coser": True,
+            "confidence": 0.95,
+            "reason": "博文含有漫展返图及角色扮演信息"
+        }
+        
+        with patch("src.tools.bilibili_scraper.BilibiliScraper.resolve_uids_batch", new_callable=AsyncMock) as mock_resolve, \
+             patch("src.tools.bilibili_scraper.BilibiliScraper.fetch_bilibili_posts", new_callable=AsyncMock) as mock_fetch, \
+             patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+             
+            mock_resolve.return_value = {
+                "999111": mock_profile_a,
+                "999222": mock_profile_b
+            }
+            mock_fetch.return_value = mock_posts
+            mock_llm.return_value = mock_llm_res
+            
+            # 执行核验
+            verified_count = await DiscoveryService.verify_pending_candidates(limit=5)
+            # 两个候选人都通过了核验（A 通过强特征，B 通过 LLM）
+            assert verified_count == 2
+            
+            # 2. 检查候选人表中的状态：应该都依然是 pending，但 is_verified=1
+            pending_list = DBService.list_candidates("pending")
+            # 两个候选人都在 pending 列表中
+            names_in_pending = {c["name"] for c in pending_list}
+            assert "强特征未自动审批Coser" in names_in_pending
+            assert "LLM未自动审批用户" in names_in_pending
+            
+            cand_a = next(c for c in pending_list if c["name"] == "强特征未自动审批Coser")
+            cand_b = next(c for c in pending_list if c["name"] == "LLM未自动审批用户")
+            
+            assert cand_a["is_verified"] == 1
+            assert cand_a["verify_reason"] == "Bio 关键词匹配成功"
+            
+            assert cand_b["is_verified"] == 1
+            assert "[LLM]" in cand_b["verify_reason"]
+            assert "博文含有漫展返图" in cand_b["verify_reason"]
+            
+            # 3. 检查正式 cosers 表：不应有这两个 Coser
+            cosers = DBService.list_cosers()
+            cosers_names = {c["name"] for c in cosers}
+            assert "强特征未自动审批Coser" not in cosers_names
+            assert "LLM未自动审批用户" not in cosers_names
+            
+            # 4. 检查隔离的博文表：由于没有自动审批，候选人 B 的博文数据不应该被物理清理
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT content FROM candidate_raw_posts WHERE candidate_id = ?;", (cand_b["id"],))
+            rows = cursor.fetchall()
+            assert len(rows) > 0
+            assert "芙宁娜赛高" in rows[0][0]
+            cursor.close()
+            conn.close()
+            
+            # 5. 测试手动审批候选人 B，确认可以成功导入并清理博文
+            approve_success = DBService.approve_candidate(cand_b["id"])
+            assert approve_success is True
+            
+            # 验证 B 移出 pending 列表进入 approved
+            pending_list_after = DBService.list_candidates("pending")
+            assert "LLM未自动审批用户" not in {c["name"] for c in pending_list_after}
+            
+            approved_list = DBService.list_candidates("approved")
+            assert "LLM未自动审批用户" in {c["name"] for c in approved_list}
+            
+            # 验证 B 成功录入 cosers
+            cosers_after = DBService.list_cosers()
+            assert "LLM未自动审批用户" in {c["name"] for c in cosers_after}
+            
+            # 验证 B 的博文已被物理清理
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM candidate_raw_posts WHERE candidate_id = ?;", (cand_b["id"],))
+            count = cursor.fetchone()[0]
+            assert count == 0
+            cursor.close()
+            conn.close()
+            
+    finally:
+        # 恢复默认设置
+        settings.auto_approve_candidates = True
 
