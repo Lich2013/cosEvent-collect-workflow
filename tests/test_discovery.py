@@ -13,11 +13,16 @@ from src.config import settings
 def setup_test_db(tmp_path):
     """测试用例级数据库自动隔离与重构"""
     db_file = tmp_path / "test_discovery.db"
+    original_db = settings.db_path
+    original_auto_approve = settings.auto_approve_candidates
     settings.db_path = str(db_file)
+    settings.auto_approve_candidates = True
     init_db()
     yield
     if db_file.exists():
         db_file.unlink()
+    settings.db_path = original_db
+    settings.auto_approve_candidates = original_auto_approve
 
 def test_extract_mentions():
     """测试提及（@）提取正则表达式，包含否定后顾，防止误判邮箱地址 (Finding 4)"""

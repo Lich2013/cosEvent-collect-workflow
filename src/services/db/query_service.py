@@ -212,7 +212,7 @@ class QueryService:
             )
             SELECT DISTINCT event_id, standard_name, city, start_date, end_date
             FROM united_normalized
-            WHERE ce_status != '已取消'
+            WHERE ce_status NOT IN ('已取消', '已结束')
             """
             params = []
             

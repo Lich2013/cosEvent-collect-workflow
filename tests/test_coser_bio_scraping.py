@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import datetime
 import pytest
@@ -20,7 +21,13 @@ from src.tools.xhs_scraper import XhsScraper
 # ==============================================================================
 class MockExpectResponseContext:
     def __init__(self, value):
-        self.value = value
+        import inspect
+        if not (inspect.iscoroutine(value) or inspect.isawaitable(value)):
+            async def _wrap():
+                return value
+            self.value = _wrap()
+        else:
+            self.value = value
     async def __aenter__(self):
         return self
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -362,14 +369,16 @@ async def test_xhs_bio_scraping_dom_fallback():
     """测试小红书在 Ajax 接口未拦截到时，通过 DOM 兜底成功解析 Bio 并且主程序不崩溃"""
     scraper = XhsScraper()
     
-    mock_resp_posted = MagicMock()
-    mock_resp_posted.url = "https://www.xiaohongshu.com/api/sns/web/v1/user_posted?uid=789"
-    mock_resp_posted.status = 200
-    mock_resp_posted.json = AsyncMock(return_value={"data": {"notes": []}})
-
+    # 模拟 expect_response 抛出 TimeoutError，模拟拦截失败
     mock_page = MagicMock()
     mock_page.goto = AsyncMock()
-    mock_page.expect_response = MagicMock(return_value=MockExpectResponseContext(mock_resp_posted))
+    class MockExpectResponseErrorContext:
+        async def __aenter__(self):
+            raise Exception("Timeout intercepting otherinfo")
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_page.expect_response = MagicMock(return_value=MockExpectResponseErrorContext())
     
     # 模拟 DOM 选择器成功定位
     mock_locator = AsyncMock()
@@ -391,6 +400,137 @@ async def test_xhs_bio_scraping_dom_fallback():
         assert len(posts) == 1
         assert posts[0]["post_id"] == "bio_789"
         assert "7月10日一日店长排班" in posts[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_xhs_bio_scraping_api_success():
+    """测试小红书在 Ajax 接口拦截成功时，解析 JSON 中的 desc 字段成功获得 Bio"""
+    scraper = XhsScraper()
+    
+    mock_resp_otherinfo = MagicMock()
+    mock_resp_otherinfo.url = "https://www.xiaohongshu.com/api/sns/web/v1/user/otherinfo?target_user_id=789"
+    mock_resp_otherinfo.status = 200
+    mock_resp_otherinfo.json = AsyncMock(return_value={"data": {"desc": "这是小红书接口返回的签名：6月1日广州萤火虫出没。"}})
+
+    mock_page = MagicMock()
+    mock_page.goto = AsyncMock()
+    mock_page.expect_response = MagicMock(return_value=MockExpectResponseContext(mock_resp_otherinfo))
+    
+    # 模拟 DOM 选择器定位失败，确保完全由 API 接口提供数据
+    mock_locator = AsyncMock()
+    mock_locator.is_visible.return_value = False
+    mock_page.locator.return_value = mock_locator
+
+    mock_context = MagicMock()
+    mock_context.new_page = AsyncMock(return_value=mock_page)
+
+    with patch.object(scraper, "scrape_flow_handler") as mock_flow:
+        async def side_effect(fn, uid, limit):
+            return await fn(mock_context, uid, limit)
+        mock_flow.side_effect = side_effect
+        
+        posts = await scraper.fetch_xhs_posts("789", limit=5)
+        
+        # 验证虚拟简介动态合成成功，且只有 1 条
+        assert len(posts) == 1
+        assert posts[0]["post_id"] == "bio_789"
+        assert "6月1日广州萤火虫出没" in posts[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_xhs_bio_scraping_rate_limit_bypasses_storage_state():
+    """测试当小红书爬取遭遇风控抛出 XhsRateLimitError 时，scrape_flow_handler 捕获该异常且不执行 storage_state 回写"""
+    from src.tools.playwright_base import XhsRateLimitError
+    scraper = XhsScraper()
+    
+    # 模拟 async_playwright context
+    mock_page = MagicMock()
+    mock_page.goto = AsyncMock()
+    
+    # 模拟 context
+    mock_context = MagicMock()
+    mock_context.new_page = AsyncMock(return_value=mock_page)
+    mock_context.close = AsyncMock()
+    mock_context.storage_state = AsyncMock()  # 我们要验证这个没被调用！
+    
+    # 模拟 browser
+    mock_browser = MagicMock()
+    mock_browser.new_context = AsyncMock(return_value=mock_context)
+    mock_browser.close = AsyncMock()
+    
+    # 模拟 playwright chromium launch
+    mock_chromium = MagicMock()
+    mock_chromium.launch = AsyncMock(return_value=mock_browser)
+    
+    mock_p = MagicMock()
+    mock_p.chromium = mock_chromium
+    
+    # 用 patch.object 拦截 async_playwright 上下文管理器以避免真实启动浏览器
+    class MockAsyncPlaywrightContext:
+        async def __aenter__(self):
+            return mock_p
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    # 模拟实际调用的工作函数，抛出 XhsRateLimitError
+    async def mock_work_func(context, uid, limit):
+        raise XhsRateLimitError("Rate limit triggered in test")
+
+    with patch("src.tools.playwright_base.async_playwright", return_value=MockAsyncPlaywrightContext()), \
+         patch.object(scraper, "_check_state_cookies_expired", return_value=False):
+        
+        # 运行流程处理器
+        result = await scraper.scrape_flow_handler(mock_work_func, "789", 5)
+        
+        # 验证返回空列表
+        assert result == []
+        # 验证 context.storage_state 没有被调用 (这就是关键的隔离风控缓存验证！)
+        mock_context.storage_state.assert_not_called()
+
+
+def test_update_seed_cookies_formats(tmp_path):
+    """测试 update_seed_cookies 方法在面对不同的原始种子格式时，能以对应的格式回写"""
+    scraper = XhsScraper()
+    test_cookies = [
+        {"name": "foo", "value": "bar", "domain": ".xiaohongshu.com", "path": "/"},
+        {"name": "hello", "value": "world", "domain": ".xiaohongshu.com", "path": "/"}
+    ]
+    
+    # 格式 A: 标准 JSON List
+    seed_a = tmp_path / "seed_a.json"
+    seed_a.write_text("[]", encoding="utf-8")
+    scraper.seed_file = seed_a
+    scraper.update_seed_cookies(test_cookies)
+    
+    # 验证是否写入了标准的 JSON list
+    with open(seed_a, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert isinstance(data, list)
+    assert len(data) == 2
+    assert data[0]["name"] == "foo"
+    
+    # 格式 B: 外部双引号包裹的 JSON 字符串
+    seed_b = tmp_path / "seed_b.json"
+    seed_b.write_text('"foo=old; hello=old"', encoding="utf-8")
+    scraper.seed_file = seed_b
+    scraper.update_seed_cookies(test_cookies)
+    
+    # 验证是否写入了带转义双引号包裹的字符串
+    with open(seed_b, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert isinstance(data, str)
+    assert "foo=bar" in data
+    assert "hello=world" in data
+
+    # 格式 C: 纯文本 raw 格式
+    seed_c = tmp_path / "seed_c.txt"
+    seed_c.write_text("foo=old; hello=old", encoding="utf-8")
+    scraper.seed_file = seed_c
+    scraper.update_seed_cookies(test_cookies)
+    
+    # 验证是否写入了纯文本
+    content = seed_c.read_text(encoding="utf-8").strip()
+    assert content == "foo=bar; hello=world"
 
 
 # ==============================================================================

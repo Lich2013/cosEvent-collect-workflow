@@ -9,6 +9,10 @@ from src.config import settings
 
 from src.utils.logger import log_event
 
+class XhsRateLimitError(Exception):
+    """小红书遭遇频控/验证码阻断异常"""
+    pass
+
 class BaseScraper:
     def __init__(self, platform: str):
         self.platform = platform
@@ -17,6 +21,53 @@ class BaseScraper:
         
         # 确保运行状态目录存在
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def update_seed_cookies(self, cookies: list[dict]):
+        """根据当前有效 cookies 同步更新回写到静态种子文件"""
+        if not self.seed_file.exists():
+            return
+        
+        try:
+            # 1. 读取原种子内容判定格式
+            with open(self.seed_file, "r", encoding="utf-8") as f:
+                orig_content = f.read().strip()
+            
+            is_json_list = False
+            is_json_str = False
+            
+            try:
+                parsed = json.loads(orig_content)
+                if isinstance(parsed, list):
+                    is_json_list = True
+                elif isinstance(parsed, str):
+                    is_json_str = True
+            except Exception:
+                pass
+            
+            # 2. 根据格式序列化最新 cookies
+            if is_json_list:
+                # 格式 A: 标准 JSON List
+                new_content = json.dumps(cookies, indent=2, ensure_ascii=False)
+            else:
+                # 格式 B/C: 拼装成 name=value; 字符串
+                cookie_pairs = []
+                for c in cookies:
+                    cookie_pairs.append(f"{c['name']}={c['value']}")
+                raw_str = "; ".join(cookie_pairs)
+                
+                if is_json_str:
+                    # 格式 B: 外部包着 JSON 双引号的字符串
+                    new_content = json.dumps(raw_str, ensure_ascii=False)
+                else:
+                    # 格式 C: 纯文本
+                    new_content = raw_str
+            
+            # 3. 写入文件
+            with open(self.seed_file, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            print(f"\x1b[1;32m[Scraper] [{self.platform}] 成功将运行期最新的 {len(cookies)} 条 Cookies 同步回写更新至种子文件 {self.seed_file.name}。\x1b[0m")
+        except Exception as e:
+            print(f"\x1b[1;31m[Scraper ERROR] [{self.platform}] 同步回写种子 Cookie 失败: {e}\x1b[0m")
 
     def load_seed_cookies(self) -> list:
         """从本地的静态种子文件中自适应读取 Cookie (支持标准 JSON 列表及单行纯文本/JSON 字符串)"""
@@ -157,7 +208,10 @@ class BaseScraper:
             context = None
             try:
                 # 1. 无头模式运行
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"]
+                )
                 
                 # 2. 加载浏览器上下文 (处理 state.json 损坏降级)
                 context = await self.get_browser_context(browser)
@@ -167,8 +221,19 @@ class BaseScraper:
                 
                 # 4. 执行成功，回写最新的会话状态到 state.json
                 await context.storage_state(path=str(self.state_file))
+                
+                # 同步回写到静态种子配置文件
+                cookies = await context.cookies()
+                if cookies:
+                    self.update_seed_cookies(cookies)
+                
                 return result
                 
+            except XhsRateLimitError as rle:
+                err_msg = f"小红书遭遇频控限流/滑块验证，将跳过本轮会话回写以隔离缓存: {rle}"
+                print(f"\x1b[1;33m[Scraper RateLimit Warning] [{self.platform}] {err_msg}\x1b[0m")
+                log_event("WARNING", f"scraper_{self.platform}", err_msg, str(rle))
+                return []
             except (TimeoutError, PlaywrightTimeoutError) as te:
                 err_msg = f"页面在 {settings.page_load_timeout_seconds}s 内加载超时！优雅跳过当前爬行任务。"
                 print(f"\x1b[1;31m[Scraper Timeout ERROR] [{self.platform}] {err_msg}\x1b[0m")

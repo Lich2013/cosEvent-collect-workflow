@@ -7,7 +7,7 @@ page_load_timeout_seconds: 15
 
 # OpenAI Agent Analysis Configuration
 analyze_confidence_threshold: 0.3
-auto_approve_candidates: true
+auto_approve_candidates: false
 
 # Local self-hosted Langfuse configuration host
 langfuse_host: "http://localhost:3000"

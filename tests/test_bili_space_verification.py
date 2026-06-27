@@ -15,12 +15,15 @@ def setup_test_db(tmp_path):
     """测试用例级数据库自动隔离"""
     db_file = tmp_path / "test_bili_space_res.db"
     original_db = settings.db_path
+    original_auto_approve = settings.auto_approve_candidates
     settings.db_path = str(db_file)
+    settings.auto_approve_candidates = True
     init_db()
     yield
     if db_file.exists():
         db_file.unlink()
     settings.db_path = original_db
+    settings.auto_approve_candidates = original_auto_approve
 
 def test_register_candidates_with_mentions():
     """测试 register_candidates_from_posts 优先提取 mentions 中的 pre-bound UID"""

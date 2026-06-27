@@ -135,7 +135,12 @@ class WorkflowOrchestrator:
 
             # 3. 小红书抓取
             if platform in ("xhs", "all"):
-                for c in target_xhs_cosers:
+                for idx, c in enumerate(target_xhs_cosers):
+                    if idx > 0:
+                        import random
+                        delay = random.uniform(7.0, 10.0)
+                        print(f"\x1b[1;36m[Orchestrator] 针对小红书数据源进行频控休眠: {delay:.1f}s...\x1b[0m")
+                        await asyncio.sleep(delay)
                     processed_coser_ids.add(c["id"])
                     success_platforms["xhs"]["total"] += 1
                     try:
