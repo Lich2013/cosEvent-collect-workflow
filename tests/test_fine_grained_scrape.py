@@ -65,6 +65,11 @@ def _run_scrape_patched(cosers_fixture, coser_name=None, platform="all"):
     weibo_sc, bili_sc, xhs_sc = _make_scraper_mocks()
 
     def mock_list_active_cosers_by_schedule(plat, limit, conn=None):
+        if plat == "all":
+            return [
+                c for c in cosers_fixture
+                if any(c.get(f"{p}_uid") not in (None, '', '-') for p in ("weibo", "bilibili", "xhs"))
+            ][:limit]
         uid_col = f"{plat}_uid"
         return [
             c for c in cosers_fixture

@@ -28,7 +28,8 @@ def init_db():
             bilibili_uid TEXT,
             xhs_uid TEXT,
             is_active INTEGER DEFAULT 1,
-            created_at TEXT
+            created_at TEXT,
+            last_scraped_at TEXT
         );
         """)
         
@@ -268,6 +269,31 @@ def init_db():
         if "status_updated_at" not in cc_columns:
             cursor.execute("ALTER TABLE coser_candidates ADD COLUMN status_updated_at TEXT;")
             print("\x1b[1;32m[Database Migration] 成功为 coser_candidates 表追加 status_updated_at 列。\x1b[0m")
+            
+        # 自动为 cosers 检测并追加 last_scraped_at 字段，并迁移历史时间戳
+        cursor.execute("PRAGMA table_info(cosers);")
+        cosers_columns = [col[1] for col in cursor.fetchall()]
+        if "last_scraped_at" not in cosers_columns:
+            cursor.execute("ALTER TABLE cosers ADD COLUMN last_scraped_at TEXT;")
+            print("\x1b[1;32m[Database Migration] 成功为 cosers 表追加 last_scraped_at 列。\x1b[0m")
+            
+            # 历史数据迁移：把 coser_scrape_state 中最晚的抓取时间作为初始全局抓取时间
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='coser_scrape_state';")
+            if cursor.fetchone():
+                cursor.execute("""
+                    UPDATE cosers 
+                    SET last_scraped_at = (
+                        SELECT MAX(last_scraped_at) 
+                        FROM coser_scrape_state 
+                        WHERE coser_scrape_state.coser_id = cosers.id
+                    )
+                    WHERE EXISTS (
+                        SELECT 1 
+                        FROM coser_scrape_state 
+                        WHERE coser_scrape_state.coser_id = cosers.id
+                    );
+                """)
+                print("\x1b[1;32m[Database Migration] 成功从 coser_scrape_state 迁移历史时间戳。\x1b[0m")
             
         # 无条件执行存量 status_updated_at 数据兜底修复，防止影子表迁移或旧记录中遗留 NULL 值导致排序饥饿或冷却失效
         cursor.execute("UPDATE coser_candidates SET status_updated_at = created_at WHERE status_updated_at IS NULL;")

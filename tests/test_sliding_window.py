@@ -58,30 +58,35 @@ def test_sliding_window_scheduling_and_rotation():
     assert batch_all[2]["name"] == "CoserA"
 
 
-def test_coser_scrape_state_cascade_delete():
-    """测试 coser_scrape_state 的级联物理删除 (ON DELETE CASCADE)"""
+def test_coser_last_scraped_at_update_and_cleanup():
+    """测试 cosers 表中 last_scraped_at 字段的更新与清理"""
     # 1. 注册一个 Coser
     assert DBService.add_coser("CoserToDelete", bilibili_uid="bili_del") is True
     cosers = DBService.list_cosers()
-    coser_id = [c["id"] for c in cosers if c["name"] == "CoserToDelete"][0]
+    coser = [c for c in cosers if c["name"] == "CoserToDelete"][0]
+    coser_id = coser["id"]
+    
+    # 验证初始 last_scraped_at 为 None
+    assert coser.get("last_scraped_at") is None
 
     # 2. 写入平台时间戳状态记录
     assert DBService.update_scrape_timestamp(coser_id, "bilibili") is True
 
-    # 验证此时状态记录存在
+    # 验证此时状态记录存在且已更新
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM coser_scrape_state WHERE coser_id = ?;", (coser_id,))
-    assert cursor.fetchone()[0] == 1
+    cursor.execute("SELECT last_scraped_at FROM cosers WHERE id = ?;", (coser_id,))
+    val = cursor.fetchone()[0]
+    assert val is not None
     conn.close()
 
     # 3. 物理删除该 Coser
     assert DBService.delete_coser("CoserToDelete") is True
 
-    # 验证级联删除是否生效，coser_scrape_state 中的记录是否已被自动清理
+    # 验证该 Coser 在 cosers 表中已不复存在
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM coser_scrape_state WHERE coser_id = ?;", (coser_id,))
+    cursor.execute("SELECT COUNT(*) FROM cosers WHERE id = ?;", (coser_id,))
     assert cursor.fetchone()[0] == 0
     conn.close()
 
@@ -96,8 +101,8 @@ async def test_scrape_failure_still_updates_timestamp():
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT last_scraped_at FROM coser_scrape_state WHERE coser_id = ? AND platform = 'bilibili';", (coser_id,))
-    assert cursor.fetchone() is None
+    cursor.execute("SELECT last_scraped_at FROM cosers WHERE id = ?;", (coser_id,))
+    assert cursor.fetchone()[0] is None
     conn.close()
 
     # 2. Mock 异常情况下的 BilibiliScraper
@@ -120,7 +125,7 @@ async def test_scrape_failure_still_updates_timestamp():
     # 3. 检查数据库，验证 last_scraped_at 即使在异常情况下也被成功插入/更新
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT last_scraped_at FROM coser_scrape_state WHERE coser_id = ? AND platform = 'bilibili';", (coser_id,))
+    cursor.execute("SELECT last_scraped_at FROM cosers WHERE id = ?;", (coser_id,))
     row = cursor.fetchone()
     assert row is not None
     assert row[0] is not None
@@ -171,7 +176,7 @@ async def test_ticket_lock_concurrency():
 
 @pytest.mark.asyncio
 async def test_round_robin_batch_limit():
-    """测试多平台模式下的去重后的 batch_size 总量限制与轮转负载均衡分配"""
+    """测试多平台模式下的去重后的 batch_size 总量限制与负载分发"""
     # 1. 注册 3 个具有不同平台 UID 的 Coser
     assert DBService.add_coser("CoserA", weibo_uid="weibo_a", bilibili_uid="bili_a") is True
     assert DBService.add_coser("CoserB", bilibili_uid="bili_b") is True
@@ -206,9 +211,9 @@ async def test_round_robin_batch_limit():
 
         # 验证处理的唯一 Coser ID 数总和不超过 2
         assert total_cosers == 2
-        # weibo_a 和 weibo_c 应该被爬取
+        # 按全局排序，CoserA 和 CoserB 被选中
         assert "weibo_a" in weibo_scraped
-        assert "weibo_c" in weibo_scraped
-        # B站由于 weibo 已经占满了去重数量 2，只有重合的 bili_a 能被抓取，bili_b 不应该被抓取
+        assert "weibo_c" not in weibo_scraped  # CoserC 没在全局 Top 2 中，不爬取
+        # B站队列中，选中的 CoserA 和 CoserB 应该被爬取
         assert "bili_a" in bili_scraped
-        assert "bili_b" not in bili_scraped
+        assert "bili_b" in bili_scraped

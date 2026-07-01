@@ -17,10 +17,13 @@ def setup_test_db(tmp_path):
     original_db = settings.db_path
     settings.db_path = str(db_file)
     init_db()
+    original_auto_approve = settings.auto_approve_candidates
+    settings.auto_approve_candidates = True
     yield
     if db_file.exists():
         db_file.unlink()
     settings.db_path = original_db
+    settings.auto_approve_candidates = original_auto_approve
 
 def test_prune_weibo_suffix():
     """验证微博名字后缀清洗逻辑"""

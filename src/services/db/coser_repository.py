@@ -139,26 +139,31 @@ class CoserRepository:
 
     @staticmethod
     def list_active_cosers_by_schedule(platform: str, limit: int, conn=None) -> list[dict]:
-        """根据滑动窗口调度算法获取当前平台最久未被爬取的活跃 Coser 列表"""
-        if platform not in ("weibo", "bilibili", "xhs"):
+        """根据滑动窗口调度算法获取当前最久未被爬取的活跃 Coser 列表"""
+        if platform not in ("weibo", "bilibili", "xhs", "all"):
             raise ValueError(f"Invalid platform: {platform}")
         local_conn = conn or get_db_connection()
         cursor = local_conn.cursor()
         try:
-            platform_uid_col = f"{platform}_uid"
+            if platform == "all":
+                cond = """(
+                    (weibo_uid IS NOT NULL AND weibo_uid != '' AND weibo_uid != '-') OR
+                    (bilibili_uid IS NOT NULL AND bilibili_uid != '' AND bilibili_uid != '-') OR
+                    (xhs_uid IS NOT NULL AND xhs_uid != '' AND xhs_uid != '-')
+                )"""
+            else:
+                platform_uid_col = f"{platform}_uid"
+                cond = f"({platform_uid_col} IS NOT NULL AND {platform_uid_col} != '' AND {platform_uid_col} != '-')"
+
             query = f"""
-                SELECT c.id, c.name, c.weibo_uid, c.bilibili_uid, c.xhs_uid, c.is_active, c.created_at
-                FROM cosers c
-                LEFT JOIN coser_scrape_state s 
-                  ON c.id = s.coser_id AND s.platform = ?
-                WHERE c.is_active = 1 
-                  AND c.{platform_uid_col} IS NOT NULL 
-                  AND c.{platform_uid_col} != '' 
-                  AND c.{platform_uid_col} != '-'
-                ORDER BY s.last_scraped_at ASC
+                SELECT id, name, weibo_uid, bilibili_uid, xhs_uid, is_active, created_at, last_scraped_at
+                FROM cosers
+                WHERE is_active = 1 
+                  AND {cond}
+                ORDER BY last_scraped_at ASC
                 LIMIT ?;
             """
-            cursor.execute(query, (platform, limit))
+            cursor.execute(query, (limit,))
             rows = cursor.fetchall()
             return [
                 {
@@ -168,7 +173,8 @@ class CoserRepository:
                     "bilibili_uid": r[3],
                     "xhs_uid": r[4],
                     "is_active": r[5],
-                    "created_at": r[6]
+                    "created_at": r[6],
+                    "last_scraped_at": r[7]
                 } for r in rows
             ]
         finally:
@@ -177,10 +183,8 @@ class CoserRepository:
                 local_conn.close()
 
     @staticmethod
-    def update_scrape_timestamp(coser_id: int, platform: str, conn=None) -> bool:
-        """更新对应平台的爬取时间戳，采用 INSERT OR REPLACE 逻辑支持首次写入"""
-        if platform not in ("weibo", "bilibili", "xhs"):
-            raise ValueError(f"Invalid platform: {platform}")
+    def update_scrape_timestamp(coser_id: int, platform: str = None, conn=None) -> bool:
+        """更新对应平台的爬取时间戳"""
         local_conn = conn or get_db_connection()
         cursor = local_conn.cursor()
         try:
@@ -189,10 +193,11 @@ class CoserRepository:
             now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
             cursor.execute(
                 """
-                INSERT OR REPLACE INTO coser_scrape_state (coser_id, platform, last_scraped_at)
-                VALUES (?, ?, ?);
+                UPDATE cosers
+                SET last_scraped_at = ?
+                WHERE id = ?;
                 """,
-                (coser_id, platform, now_str)
+                (now_str, coser_id)
             )
             local_conn.commit()
             return True

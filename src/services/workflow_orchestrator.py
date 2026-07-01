@@ -63,43 +63,16 @@ class WorkflowOrchestrator:
                     target_xhs_cosers = [c for c in single_coser_list if c["xhs_uid"]]
                 processed_coser_ids = set(c["id"] for c in single_coser_list)
             else:
-                # 动态分配去重后的 Coser ID，避免各平台累加引起过度抓取 (CR 5)
-                weibo_candidates = DBService.list_active_cosers_by_schedule("weibo", batch_limit, conn=db_conn) if platform in ("weibo", "all") else []
-                bili_candidates = DBService.list_active_cosers_by_schedule("bilibili", batch_limit, conn=db_conn) if platform in ("bilibili", "all") else []
-                xhs_candidates = DBService.list_active_cosers_by_schedule("xhs", batch_limit, conn=db_conn) if platform in ("xhs", "all") else []
-
-                weibo_idx, bili_idx, xhs_idx = 0, 0, 0
-                selected_unique_ids = set()
-
-                while len(selected_unique_ids) < batch_limit:
-                    added_any = False
-
-                    if weibo_idx < len(weibo_candidates):
-                        c = weibo_candidates[weibo_idx]
-                        weibo_idx += 1
-                        if len(selected_unique_ids) < batch_limit or c["id"] in selected_unique_ids:
-                            target_weibo_cosers.append(c)
-                            selected_unique_ids.add(c["id"])
-                            added_any = True
-
-                    if bili_idx < len(bili_candidates):
-                        c = bili_candidates[bili_idx]
-                        bili_idx += 1
-                        if len(selected_unique_ids) < batch_limit or c["id"] in selected_unique_ids:
-                            target_bili_cosers.append(c)
-                            selected_unique_ids.add(c["id"])
-                            added_any = True
-
-                    if xhs_idx < len(xhs_candidates):
-                        c = xhs_candidates[xhs_idx]
-                        xhs_idx += 1
-                        if len(selected_unique_ids) < batch_limit or c["id"] in selected_unique_ids:
-                            target_xhs_cosers.append(c)
-                            selected_unique_ids.add(c["id"])
-                            added_any = True
-
-                    if not added_any:
-                        break
+                # 统一获取全局最久未爬取的活跃 Coser 队列
+                target_cosers = DBService.list_active_cosers_by_schedule(platform, batch_limit, conn=db_conn)
+                for c in target_cosers:
+                    if platform in ("weibo", "all") and c["weibo_uid"] and c["weibo_uid"] not in ("", "-"):
+                        target_weibo_cosers.append(c)
+                    if platform in ("bilibili", "all") and c["bilibili_uid"] and c["bilibili_uid"] not in ("", "-"):
+                        target_bili_cosers.append(c)
+                    if platform in ("xhs", "all") and c["xhs_uid"] and c["xhs_uid"] not in ("", "-"):
+                        target_xhs_cosers.append(c)
+                    processed_coser_ids.add(c["id"])
 
             # 1. 微博抓取
             if platform in ("weibo", "all"):
