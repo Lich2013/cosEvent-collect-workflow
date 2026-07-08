@@ -36,6 +36,7 @@ env/
 .vscode/
 .idea/
 .agent
+.codex/
 
 # Local Configuration & Sensitive Files
 .env
