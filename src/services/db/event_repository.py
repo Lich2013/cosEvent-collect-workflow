@@ -1,11 +1,11 @@
 import sqlite3
-import datetime
 import re
 from src.models.db_models import get_db_connection
 from src.services.fusion_service import EventFusionService
 from src.utils.logger import log_event
 from src.utils.validation import validate_status, validate_type
 from src.utils.parsers import parse_city
+from src.utils.time import beijing_today_str, beijing_now_str
 
 class EventRepository:
     @staticmethod
@@ -64,10 +64,12 @@ class EventRepository:
                 )
                 existing_rows = cursor.fetchall()
                 
-                # 以当前日期为分流基准线，强行对齐到北京时间 (UTC+8)
-                beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-                current_date = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d")
-                now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+                # 以统一北京时间为分流基准线。
+                current_date = beijing_today_str()
+                now_str = beijing_now_str()
+
+                def is_historical_date(date_val: str) -> bool:
+                    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", date_val or "")) and date_val < current_date
                 
                 # 查询该 Coser 在全局所有平台的所有既存活动（排除已取消的）以进行全局 Upsert 合并
                 cursor.execute(
@@ -82,9 +84,7 @@ class EventRepository:
                 coser_future_events = []
                 for r in coser_active_rows:
                     r_id, r_raw_post_id, r_name, r_date, r_place, r_desc, r_source_url, r_conf, r_status, r_norm_id, r_type = r
-                    is_historical_r = False
-                    if re.match(r"^\d{4}-\d{2}-\d{2}$", r_date):
-                        is_historical_r = r_date < current_date
+                    is_historical_r = is_historical_date(r_date)
                     if not is_historical_r:
                         coser_future_events.append(list(r))
                 
@@ -92,9 +92,7 @@ class EventRepository:
                 existing_future_map = {}
                 for r_id, r_name, r_date, r_place, r_status, r_norm_id in existing_rows:
                     if r_status != '已取消':
-                        is_historical_r = False
-                        if re.match(r"^\d{4}-\d{2}-\d{2}$", r_date):
-                            is_historical_r = r_date < current_date
+                        is_historical_r = is_historical_date(r_date)
                         
                         if not is_historical_r:
                             existing_future_map[(r_name, r_date, r_place)] = (r_id, r_norm_id)
@@ -185,35 +183,21 @@ class EventRepository:
                     event_type = event.get("event_type", "漫展") or "漫展"
                     validate_type(event_type)
                     
-                    # 城市智能解析与时空融合归一化判定
-                    city = parse_city(event_place)
-                    normalized_id = EventFusionService.find_or_create_normalized_event(
-                        cursor, event_name, city, event_date, event_type
-                    )
-                    affected_norm_ids.add(normalized_id)
-                    
                     # 判断当前活动是否为历史发生行程
-                    is_historical = False
-                    if re.match(r"^\d{4}-\d{2}-\d{2}$", event_date):
-                        is_historical = event_date < current_date
+                    is_historical = is_historical_date(event_date)
                         
                     if is_historical:
-                        # 历史行程冻结保护：仅当完全不存在相同活动且未被取消时才作为增量写入，绝不覆盖/删除历史
-                        duplicate_history = False
-                        for r_id, r_name, r_date, r_place, r_status, r_norm_id in existing_rows:
-                            if r_name == event_name and r_date == event_date and r_place == event_place and r_status != '已取消':
-                                duplicate_history = True
-                                break
-                        if not duplicate_history:
-                            validate_status('未开始')
-                            cursor.execute(
-                                """
-                                INSERT INTO cosplay_events (raw_post_id, coser_name, event_name, event_date, event_place, event_description, confidence, source_url, status, normalized_event_id, event_type, created_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '未开始', ?, ?, ?);
-                                """,
-                                (raw_post_id, coser_name, event_name, event_date, event_place, event_description, confidence, source_url, normalized_id, event_type, now_str)
-                            )
+                        err_msg = f"LLM 返回历史活动 [{event_name}]({event_date})，早于当前参考日期 {current_date}，已跳过写入。"
+                        log_event("WARNING", "event_history_filter", err_msg, source_url or "")
+                        continue
                     else:
+                        # 城市智能解析与时空融合归一化判定。历史活动在此之前已被跳过，避免污染归一化节点。
+                        city = parse_city(event_place)
+                        normalized_id = EventFusionService.find_or_create_normalized_event(
+                            cursor, event_name, city, event_date, event_type
+                        )
+                        affected_norm_ids.add(normalized_id)
+
                         # 未来行程增量对齐合并 (Upsert)
                         key = (event_name, event_date, event_place)
                         new_future_keys.add(key)

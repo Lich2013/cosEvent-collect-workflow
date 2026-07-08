@@ -1,6 +1,7 @@
 import os
 import sys
 import sqlite3
+import datetime
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -16,10 +17,19 @@ from src.main import cli
 from src.models.schemas import CosEvent
 
 @pytest.fixture(autouse=True)
-def setup_test_db(tmp_path):
+def setup_test_db(tmp_path, monkeypatch):
     """测试夹具：自动配置临时隔离测试数据库"""
     db_file = tmp_path / "test_cosevent_niche.db"
     settings.db_path = str(db_file)
+    frozen_now = datetime.datetime(2026, 7, 5, 12, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+    monkeypatch.setattr("src.utils.time.beijing_now", lambda: frozen_now)
+    monkeypatch.setattr("src.utils.time.beijing_today", lambda: frozen_now.date())
+    monkeypatch.setattr("src.utils.time.beijing_today_str", lambda: "2026-07-05")
+    monkeypatch.setattr("src.utils.time.beijing_now_str", lambda: "2026-07-05 12:00:00")
+    monkeypatch.setattr("src.services.db.materialize_service.beijing_today", lambda: frozen_now.date())
+    monkeypatch.setattr("src.services.db.materialize_service.beijing_now_str", lambda: "2026-07-05 12:00:00")
+    monkeypatch.setattr("src.services.fusion_service.beijing_now", lambda: frozen_now)
+    monkeypatch.setattr("src.services.fusion_service.beijing_now_str", lambda: "2026-07-05 12:00:00")
     init_db()
     yield
     # 清理临时文件
@@ -345,7 +355,8 @@ def test_materialized_view_rebuild():
     import os
     
     # 1. 动态生成近期与远期日期
-    today = datetime.date.today()
+    from src.utils.time import beijing_today
+    today = beijing_today()
     active_date = (today + datetime.timedelta(days=10)).strftime("%Y-%m-%d")
     old_date = (today - datetime.timedelta(days=50)).strftime("%Y-%m-%d")
     
@@ -507,5 +518,3 @@ def test_materialized_view_rebuild():
     res = runner.invoke(cli, ["materialize"])
     assert res.exit_code == 0
     assert "物化展示表及滑动去重重建成功完成" in res.output
-
-

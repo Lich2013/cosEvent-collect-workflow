@@ -10,13 +10,22 @@ from src.services.db.candidate_repository import CandidateRepository
 from src.config import settings
 
 @pytest.fixture(autouse=True)
-def setup_test_db(tmp_path):
+def setup_test_db(tmp_path, monkeypatch):
     """测试用例级数据库自动隔离与重构"""
     db_file = tmp_path / "test_discovery.db"
     original_db = settings.db_path
     original_auto_approve = settings.auto_approve_candidates
     settings.db_path = str(db_file)
     settings.auto_approve_candidates = True
+
+    frozen_now = datetime.datetime(2026, 6, 15, 12, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+    monkeypatch.setattr("src.utils.time.beijing_now", lambda: frozen_now)
+    monkeypatch.setattr("src.utils.time.beijing_today", lambda: frozen_now.date())
+    monkeypatch.setattr("src.utils.time.beijing_today_str", lambda: "2026-06-15")
+    monkeypatch.setattr("src.utils.time.beijing_now_str", lambda: "2026-06-15 12:00:00")
+    monkeypatch.setattr("src.services.db.candidate_repository.beijing_now_str", lambda: "2026-06-15 12:00:00")
+    monkeypatch.setattr("src.services.db.coser_repository.beijing_now_str", lambda: "2026-06-15 12:00:00")
+    monkeypatch.setattr("src.utils.templates.beijing_today_str", lambda: "2026-06-15")
     init_db()
     yield
     if db_file.exists():
@@ -691,3 +700,57 @@ async def test_candidate_verification_no_auto_approve():
         # 恢复默认设置
         settings.auto_approve_candidates = True
 
+
+@pytest.mark.asyncio
+async def test_candidate_empty_posts_keep_pending():
+    """候选人抓取无可核验证据时保留 pending，不直接 hard-ignore。"""
+    CandidateRepository.add_candidate(
+        name="空结果待重试候选人",
+        platform="bilibili",
+        matched_bili_uid="777001"
+    )
+
+    with patch("src.tools.bilibili_scraper.BilibiliScraper.resolve_uids_batch", new_callable=AsyncMock) as mock_resolve, \
+         patch("src.tools.bilibili_scraper.BilibiliScraper.fetch_bilibili_posts", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.agents.event_agent.analyze_candidate_posts", new_callable=AsyncMock) as mock_llm:
+
+        mock_resolve.return_value = {"777001": {"bio": "普通简介", "verify_desc": ""}}
+        mock_fetch.return_value = []
+
+        verified_count = await DiscoveryService.verify_pending_candidates(limit=5)
+
+    assert verified_count == 0
+    mock_llm.assert_not_called()
+
+    pending = CandidateRepository.list_candidates("pending")
+    assert len(pending) == 1
+    assert pending[0]["name"] == "空结果待重试候选人"
+    assert pending[0]["is_verified"] == 0
+    assert CandidateRepository.list_candidates("ignored") == []
+
+
+def test_candidate_rediscovery_preserves_verified_state():
+    """重复发现同名候选人时保留 is_verified 与 verify_reason，并合并新增 UID。"""
+    CandidateRepository.add_candidate(
+        name="已核验待审批候选人",
+        platform="weibo",
+        matched_weibo_uid="100001",
+        is_verified=1,
+        verify_reason="[LLM] 已确认是活跃 Coser"
+    )
+
+    CandidateRepository.add_candidate(
+        name="已核验待审批候选人",
+        platform="bilibili",
+        matched_bili_uid="200002",
+        is_verified=0,
+        verify_reason=None
+    )
+
+    pending = CandidateRepository.list_candidates("pending")
+    assert len(pending) == 1
+    cand = pending[0]
+    assert cand["is_verified"] == 1
+    assert cand["verify_reason"] == "[LLM] 已确认是活跃 Coser"
+    assert cand["matched_weibo_uid"] == "100001"
+    assert cand["matched_bili_uid"] == "200002"

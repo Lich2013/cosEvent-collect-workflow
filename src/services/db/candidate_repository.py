@@ -1,7 +1,7 @@
 import sqlite3
-import datetime
 from src.models.db_models import get_db_connection
 from src.utils.logger import log_event
+from src.utils.time import beijing_now_str
 
 class CandidateRepository:
     """
@@ -25,8 +25,7 @@ class CandidateRepository:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
             
             # 先查询是否已存在此候选人
             cursor.execute("SELECT id, status FROM coser_candidates WHERE name = ?", (name,))
@@ -52,8 +51,8 @@ class CandidateRepository:
                     merged_score = match_score if match_score > 0.0 else (exist_score or 0.0)
                     merged_ref = source_ref if source_ref else exist_ref
                     merged_plat = platform if platform else exist_plat
-                    merged_verified = is_verified if is_verified != 0 else 0
-                    merged_reason = verify_reason if verify_reason else None
+                    merged_verified = 1 if (is_verified == 1 or exist_verified == 1) else 0
+                    merged_reason = verify_reason if verify_reason else exist_reason
 
                     cursor.execute(
                         """
@@ -161,8 +160,7 @@ class CandidateRepository:
             cursor.execute("SELECT id, bilibili_uid, weibo_uid, xhs_uid FROM cosers WHERE name = ?", (name,))
             exist_coser = cursor.fetchone()
             
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
             
             if exist_coser:
                 coser_id, exist_bili, exist_weibo, exist_xhs = exist_coser
@@ -222,8 +220,7 @@ class CandidateRepository:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
             cursor.execute(
                 "UPDATE coser_candidates SET status = 'ignored', status_updated_at = ? WHERE id = ? AND status IN ('pending', 'undetermined');",
                 (now_str, candidate_id)
@@ -251,8 +248,7 @@ class CandidateRepository:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
             cursor.execute(
                 "UPDATE coser_candidates SET status = 'undetermined', status_updated_at = ? WHERE id = ? AND status = 'pending';",
                 (now_str, candidate_id)
@@ -281,8 +277,7 @@ class CandidateRepository:
         cursor = conn.cursor()
         inserted_count = 0
         try:
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
             for post in posts:
                 post_id = post["post_id"]
                 content = post["content"]

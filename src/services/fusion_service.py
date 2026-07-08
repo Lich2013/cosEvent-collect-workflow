@@ -11,6 +11,7 @@ from src.utils.logger import log_event
 from agents import Agent, Runner, RunConfig
 from src.utils.llm_factory import registry_model_provider
 from src.utils.parsers import clean_event_name, MAJOR_CITIES_COMBINED
+from src.utils.time import beijing_now, beijing_now_str
 
 # 小众极简泛称旁路配置由 settings.bypass_generic_names 动态控制
 
@@ -109,7 +110,7 @@ class EventFusionService:
             event_name_cleaned = "未知漫展"
         
         name_slug = EventFusionService._clean_name(event_name_cleaned)
-        now_str = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = beijing_now_str()
 
         # 解析当前日程的时间
         current_dt = None
@@ -221,7 +222,7 @@ class EventFusionService:
                 else:
                     try:
                         node_year = int(s_date.split("-")[0])
-                        current_year = datetime.datetime.now().year
+                        current_year = beijing_now().year
                         if node_year >= current_year:
                             time_overlap = True
                     except Exception:
@@ -329,7 +330,7 @@ class EventFusionService:
                 else:
                     try:
                         node_year = int(start_date.split("-")[0])
-                        current_year = datetime.datetime.now().year
+                        current_year = beijing_now().year
                         if node_year >= current_year:
                             time_overlap = True
                     except Exception:
@@ -383,7 +384,7 @@ class EventFusionService:
                 )
                 if is_same:
                     # 确认是同一个，写入别名缓存表 (同样统一使用清洗后的别名)
-                    now_str = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                    now_str = beijing_now_str()
                     cursor.execute(
                         """
                         INSERT INTO event_aliases (alias_name, city, normalized_event_id, created_at)
@@ -395,7 +396,7 @@ class EventFusionService:
                     matched_node_id = node_id
                     break
 
-        now_str = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = beijing_now_str()
         
         if matched_node_id is not None:
             return matched_node_id

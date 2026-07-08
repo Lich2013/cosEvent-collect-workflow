@@ -166,7 +166,7 @@ class WorkflowOrchestrator:
     @staticmethod
     async def run_analyze(confidence_threshold: float) -> tuple[int, int, int]:
         """[Analyze Phase] 增量式分析未处理博文并原子性提炼活动入库"""
-        from src.agents.event_agent import analyze_post_with_retry
+        from src.agents.event_agent import TransientLLMError, analyze_post_with_retry
         import sqlite3
         
         pending_posts = DBService.get_unanalyzed_posts()
@@ -192,6 +192,9 @@ class WorkflowOrchestrator:
                 else:
                     err_msg = f"博文 ID {p['id']} 事务原子性入库失败（软异常已自动回滚）。"
                     log_event("ERROR", "analyzer_transaction", err_msg)
+            except TransientLLMError as transient_err:
+                err_msg = f"提炼博文 ID {p['id']} 时发生暂时性 LLM 异常: {transient_err}。将保持未分析状态以备下轮自动重试。"
+                log_event("ERROR", "analyzer_analyze", err_msg, str(transient_err))
             except (AssertionError, sqlite3.IntegrityError, ValueError, TypeError, AttributeError) as permanent_err:
                 # 结构性/格式性永久故障：主事务安全回滚，开启独立短事务将状态置为 2 以防死循环
                 err_msg = f"处理博文 ID {p['id']} 时遭遇永久性结构故障: {permanent_err}。系统已安全回滚主数据，并强制将状态标记为熔断挂起 (is_analyzed = 2)。"

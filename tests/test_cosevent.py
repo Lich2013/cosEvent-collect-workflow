@@ -1,6 +1,7 @@
 import os
 import sys
 import sqlite3
+import datetime
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -13,10 +14,24 @@ from src.config import settings
 from src.models.schemas import TriageOutput
 
 @pytest.fixture(autouse=True)
-def setup_test_db(tmp_path):
+def setup_test_db(tmp_path, monkeypatch):
     """测试夹具：自动配置临时内存或临时文件数据库，确保测试隔离"""
     db_file = tmp_path / "test_cosevent.db"
     settings.db_path = str(db_file)
+
+    frozen_now = datetime.datetime(2026, 5, 25, 12, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+    monkeypatch.setattr("src.utils.time.beijing_now", lambda: frozen_now)
+    monkeypatch.setattr("src.utils.time.beijing_today", lambda: frozen_now.date())
+    monkeypatch.setattr("src.utils.time.beijing_today_str", lambda: "2026-05-25")
+    monkeypatch.setattr("src.utils.time.beijing_now_str", lambda: "2026-05-25 12:00:00")
+    monkeypatch.setattr("src.utils.templates.beijing_today_str", lambda: "2026-05-25")
+    monkeypatch.setattr("src.services.db.query_service.beijing_today_str", lambda: "2026-05-25")
+    monkeypatch.setattr("src.services.db.event_repository.beijing_today_str", lambda: "2026-05-25")
+    monkeypatch.setattr("src.services.db.event_repository.beijing_now_str", lambda: "2026-05-25 12:00:00")
+    monkeypatch.setattr("src.services.db.materialize_service.beijing_today", lambda: frozen_now.date())
+    monkeypatch.setattr("src.services.db.materialize_service.beijing_now_str", lambda: "2026-05-25 12:00:00")
+    monkeypatch.setattr("src.services.fusion_service.beijing_now", lambda: frozen_now)
+    monkeypatch.setattr("src.services.fusion_service.beijing_now_str", lambda: "2026-05-25 12:00:00")
     init_db()
     yield
     # 清理临时文件
@@ -761,7 +776,7 @@ async def test_repost_incremental_update():
     assert cursor.fetchone()[0] == 1
     
     cursor.execute("SELECT COUNT(*) FROM cosplay_events WHERE raw_post_id = ?;", (raw_post_id,))
-    assert cursor.fetchone()[0] == 2
+    assert cursor.fetchone()[0] == 1
     conn.close()
     
     # 3. 模拟二次抓取编辑后的微博 (edit_count=1)
@@ -786,7 +801,7 @@ async def test_repost_incremental_update():
     conn.close()
     
     # 4. 进行第二次增量写入：
-    # - 历史活动 (2026-01-10) 保持不变，不重复插入，也不被删除 (固化保护)
+    # - 历史活动 (2026-01-10) 由持久化层硬过滤，不写入未来日程流
     # - 旧的未来行程 (2026-06-01) 此次被 Coser 砍掉取消了 (对齐清理)
     # - 新增一个全新的未来行程 (2026-07-01) (增量合并)
     new_extracted_events = [
@@ -827,18 +842,13 @@ async def test_repost_incremental_update():
     assert cursor.fetchone()[0] == 1
     conn.close()
     
-    # 应当只有 2 条活动：固化的 2026-01-10 历史活动，和新增的 2026-07-01 未来活动。
+    # 应当只有 1 条有效活动：新增的 2026-07-01 未来活动。
     # 2026-06-01 的旧未来活动已被软删除对齐。
-    assert len(events_in_db) == 2
-    
-    assert events_in_db[0][0] == "历史漫展"
-    assert events_in_db[0][1] == "2026-01-10"
-    assert events_in_db[0][3] == "芙宁娜"
-    
-    assert events_in_db[1][0] == "新未来漫展B"
-    assert events_in_db[1][1] == "2026-07-01"
-    assert events_in_db[1][2] == "广州世贸馆"
-    assert events_in_db[1][3] == "神里绫华"
+    assert len(events_in_db) == 1
+    assert events_in_db[0][0] == "新未来漫展B"
+    assert events_in_db[0][1] == "2026-07-01"
+    assert events_in_db[0][2] == "广州世贸馆"
+    assert events_in_db[0][3] == "神里绫华"
 
 
 @pytest.mark.asyncio
@@ -1003,16 +1013,8 @@ async def test_harden_and_timezone_align():
     conn.close()
     
     # 2. 模拟服务器 UTC 时间为 2026-05-23 23:00:00 (即北京时间 2026-05-24 07:00:00)
-    # 我们 mock 系统的 datetime.datetime.now 并在 Mock 块内执行数据保存与增量分析
-    class MockDatetime(datetime.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            if tz is not None:
-                # 传入时区时，以 UTC 2026-05-23 23:00:00 加上时区偏移
-                base_utc = datetime.datetime(2026, 5, 23, 23, 0, 0, tzinfo=datetime.timezone.utc)
-                return base_utc.astimezone(tz)
-            # Naive datetime 模拟 UTC 部署的服务器本地 naive 时间 2026-05-23 23:00:00
-            return datetime.datetime(2026, 5, 23, 23, 0, 0)
+    # 统一时钟工具负责向各业务模块提供北京参考时间。
+    fixed_beijing_now = datetime.datetime(2026, 5, 24, 7, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
             
     # 要注入的提取事件：2026-05-23 (在北京时间来看是历史发生的行程)
     extracted_events = [
@@ -1042,7 +1044,13 @@ async def test_harden_and_timezone_align():
         "published_at": "2026-05-24 13:00:00"
     }]
     
-    with patch("src.services.db_service.datetime.datetime", new=MockDatetime):
+    with patch("src.services.db.coser_repository.beijing_now_str", return_value="2026-05-24 07:00:00"), \
+         patch("src.services.db.event_repository.beijing_now_str", return_value="2026-05-24 07:00:00"), \
+         patch("src.services.db.event_repository.beijing_today_str", return_value="2026-05-24"), \
+         patch("src.services.db.materialize_service.beijing_now_str", return_value="2026-05-24 07:00:00"), \
+         patch("src.services.db.materialize_service.beijing_today", return_value=fixed_beijing_now.date()), \
+         patch("src.services.fusion_service.beijing_now", return_value=fixed_beijing_now), \
+         patch("src.services.fusion_service.beijing_now_str", return_value="2026-05-24 07:00:00"):
         # 写入 raw_posts，触发应用层北京时间 scraped_at 注入
         DBService.save_raw_posts(coser_id, "weibo", posts)
         
@@ -1070,15 +1078,10 @@ async def test_harden_and_timezone_align():
     cursor.close()
     conn.close()
     
-    assert len(events) == 2
-    assert events[0][0] == "北京时区历史展"
-    assert events[0][1] == "2026-05-23"
-    # 验证 cosplay_events 的 created_at 在应用层已被精确锁死为 mock 对应的北京时间 "2026-05-24 07:00:00"
+    assert len(events) == 1
+    assert events[0][0] == "北京时区未来展"
+    assert events[0][1] == "2026-05-24"
     assert events[0][3] == "2026-05-24 07:00:00"
-    
-    assert events[1][0] == "北京时区未来展"
-    assert events[1][1] == "2026-05-24"
-    assert events[1][3] == "2026-05-24 07:00:00"
     
     # 清理测试数据
     DBService.delete_coser("时区测试姬")
@@ -1272,7 +1275,7 @@ async def test_soft_state_machine_multi_version():
     """测试多版本置顶微博的软状态机级联变更：
     1. 写入 v0 版微博 (edit_count=0, post_id="123456")，包含历史和未来行程
     2. 写入 v1 版编辑微博 (edit_count=1, post_id="123456#v1")，未来行程有更新
-    3. 校验 v0 版的未来行程被级联更新为 '已取消'，但历史行程受固化保护保持不变
+    3. 校验 v0 版的未来行程被级联更新为 '已取消'，历史行程被持久化层过滤
     4. 校验 get_all_events() 过滤掉了所有 '已取消' 行程
     """
     from src.services.db_service import DBService
@@ -1374,9 +1377,9 @@ async def test_soft_state_machine_multi_version():
     cursor.execute("SELECT status FROM cosplay_events WHERE raw_post_id = ? AND event_name = '未来漫展v0';", (raw_post_id_v0,))
     assert cursor.fetchone()[0] == "已取消"
 
-    # 验证 v0 版本的历史漫展v0是否依旧是 '未开始' (冷冻保护)
-    cursor.execute("SELECT status FROM cosplay_events WHERE raw_post_id = ? AND event_name = '历史漫展v0';", (raw_post_id_v0,))
-    assert cursor.fetchone()[0] == "未开始"
+    # 验证 v0 版本的历史漫展v0被过滤，不进入未来日程流
+    cursor.execute("SELECT COUNT(*) FROM cosplay_events WHERE raw_post_id = ? AND event_name = '历史漫展v0';", (raw_post_id_v0,))
+    assert cursor.fetchone()[0] == 0
 
     # 验证 v1 版本的新未来行程是否是 '未开始'
     cursor.execute("SELECT status FROM cosplay_events WHERE raw_post_id = ? AND event_name = '更新未来漫展v1';", (raw_post_id_v1,))
@@ -1385,9 +1388,9 @@ async def test_soft_state_machine_multi_version():
 
     # 7. 验证 get_all_events() 过滤 '已取消' 日程
     all_events = DBService.get_all_events(0.3)
-    # 应只包含 "历史漫展v0" (v0 版的) 和 "更新未来漫展v1" (v1 版的)，排除 "未来漫展v0" (已取消)
+    # 应只包含 "更新未来漫展v1" (v1 版的)，排除历史和已取消日程
     active_names = [e["event_name"] for e in all_events if e["coser_name"] == "多版本测试姬"]
-    assert "历史漫展v0" in active_names
+    assert "历史漫展v0" not in active_names
     assert "更新未来漫展v1" in active_names
     assert "未来漫展v0" not in active_names
 
@@ -2127,6 +2130,93 @@ async def test_analyzer_breaker_transient_failure():
 
 
 @pytest.mark.asyncio
+async def test_analyzer_consensus_all_extractors_failure_keeps_pending():
+    """所有 extractor 临时失败时应保持 is_analyzed=0，不进入结构性熔断。"""
+    from src.agents.event_agent import TransientLLMError
+    from src.services.workflow_orchestrator import WorkflowOrchestrator
+
+    DBService.add_coser("提取器全挂测试姬")
+    coser_id = DBService.list_cosers()[0]["id"]
+    DBService.save_raw_posts(coser_id, "weibo", [{"post_id": "all_extractors_down", "content": "漫展行程", "post_url": "url"}])
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE post_id = 'all_extractors_down';")
+    raw_post_id = cursor.fetchone()[0]
+    conn.close()
+
+    with patch("src.agents.event_agent.analyze_post_with_retry", side_effect=TransientLLMError("all extractors down")):
+        total, success, analyzed = await WorkflowOrchestrator.run_analyze(confidence_threshold=0.3)
+
+    assert total == 1
+    assert success == 0
+    assert analyzed == 0
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_analyzed FROM raw_posts WHERE id = ?;", (raw_post_id,))
+    assert cursor.fetchone()[0] == 0
+    conn.close()
+
+
+def test_historical_events_are_skipped_before_fusion():
+    """历史活动不应写入 cosplay_events，也不应创建 normalized_events。"""
+    DBService.add_coser("历史过滤测试姬")
+    coser_id = DBService.list_cosers()[0]["id"]
+    DBService.save_raw_posts(coser_id, "weibo", [{"post_id": "history_filter_post", "content": "历史行程", "post_url": "url"}])
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM raw_posts WHERE post_id = 'history_filter_post';")
+    raw_post_id = cursor.fetchone()[0]
+    conn.close()
+
+    events = [
+        {
+            "event_name": "已过期漫展",
+            "event_date": "2026-05-01",
+            "event_place": "上海国家会展中心",
+            "event_description": "历史行程",
+            "confidence": 0.95,
+            "source_url": "url",
+            "event_type": "漫展",
+        },
+        {
+            "event_name": "未来漫展",
+            "event_date": "2026-07-01",
+            "event_place": "上海国家会展中心",
+            "event_description": "未来行程",
+            "confidence": 0.95,
+            "source_url": "url",
+            "event_type": "漫展",
+        },
+        {
+            "event_name": "未知日期活动",
+            "event_date": "未知",
+            "event_place": "广州",
+            "event_description": "待定",
+            "confidence": 0.95,
+            "source_url": "url",
+            "event_type": "一日店长",
+        },
+    ]
+
+    assert DBService.save_extracted_events_transactional(raw_post_id, events, 0.3) is True
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT event_name FROM cosplay_events WHERE raw_post_id = ? ORDER BY id;", (raw_post_id,))
+    stored_names = [r[0] for r in cursor.fetchall()]
+    assert "已过期漫展" not in stored_names
+    assert "未来漫展" in stored_names
+    assert "未知日期活动" in stored_names
+
+    cursor.execute("SELECT COUNT(*) FROM normalized_events WHERE standard_name = '已过期漫展';")
+    assert cursor.fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.asyncio
 async def test_breaker_permanent_failure_raises_and_marks_2():
     """测试用例 1：模拟大模型提炼通过，但在入库约束中故意触发 AssertionError，验证主活动表未插入任何脏数据，而 raw_posts.is_analyzed 状态成功置为 2 且下一轮分析不再加载。"""
     from src.services.db_service import DBService
@@ -2560,7 +2650,3 @@ def test_coser_duplicate_warnings():
     assert len(warnings) == 2
     assert any("已被 Coser [桃景三酪] 绑定" in w for w in warnings)
     assert any("已被 Coser [桃景三酪_] 绑定" in w for w in warnings)
-
-
-
-

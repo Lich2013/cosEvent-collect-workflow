@@ -5,6 +5,7 @@ import json
 import os
 from src.models.db_models import get_db_connection
 from src.utils.parsers import parse_city, clean_event_name
+from src.utils.time import beijing_now_str, beijing_today
 
 
 class MaterializeService:
@@ -39,7 +40,7 @@ class MaterializeService:
         }
 
         audit_log = {
-            "timestamp": datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": beijing_now_str(),
             "frozen_nodes": [],
             "new_clusters": []
         }
@@ -103,7 +104,7 @@ class MaterializeService:
                 })
 
             # 4. 滑动窗口临界点
-            today = datetime.date.today()
+            today = beijing_today()
             t_cold = today - datetime.timedelta(days=30)
             t_cold_str = t_cold.strftime("%Y-%m-%d")
 
@@ -280,7 +281,7 @@ class MaterializeService:
                 cursor.execute("DELETE FROM final_exhibition_view WHERE is_frozen = 0;")
 
                 # 9.2 写入新生成的超级物化节点
-                now_str = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                now_str = beijing_now_str()
                 for node in new_normalized_nodes:
                     cursor.execute(
                         """

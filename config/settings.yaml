@@ -23,12 +23,12 @@ langfuse_host: "http://localhost:3000"
 # ==============================================================================
 llm_providers:
   openai:
-    base_url: "https://api.openai.com/v1"
+    base_url: "https://ai.lich.moe/v1"
     api_key: "${OPENAI_API_KEY}"
-    default_model: "gpt-4o-mini"
+    default_model: "gpt-5.5"
   
   deepseek:
-    base_url: "https://api.deepseek.com/v1"
+    base_url: "http://ai.lich.moe/v1"
     api_key: "${DEEPSEEK_API_KEY}"
     default_model: "deepseek-v4-flash"
 

@@ -1,10 +1,5 @@
-import os
-import datetime
-import logging
 import json
 import asyncio
-import re
-from pathlib import Path
 from pydantic import ValidationError
 from agents import Agent, Runner, RunConfig
 from src.models.schemas import FinalOutput, TriageOutput, CandidateVerifyOutput
@@ -16,6 +11,10 @@ from src.utils.logger import log_event
 def get_rendered_instructions(template_name: str = "event_analysis.jinja2") -> str:
     """动态读取并使用 Jinja2 模板渲染 System Prompt，注入当前系统参考时间"""
     return render_instruction_template(template_name)
+
+
+class TransientLLMError(Exception):
+    """Temporary LLM/provider failure that should be retried in a later scheduler run."""
 
 class AgentPipeline:
     """
@@ -34,7 +33,7 @@ class AgentPipeline:
         
         triage_agent = Agent(
             name="triage_analyzer",
-            instructions="你是一个 Cosplay 活动初筛专家。请评估博文内容，判断博主是否发布了未来的漫展计划、一日店长（罗森店长等）、摄影会、受邀到店模特、签售出行、排班表或快闪计划。必须严格遵循规定的 Pydantic 强契约输出。",
+            instructions=get_rendered_instructions("event_triage.jinja2"),
             output_type=TriageOutput,
             model=triage_model_spec
         )
@@ -103,8 +102,8 @@ class AgentPipeline:
                 })
         
         if not valid_outputs:
-            # 所有提取器均因接口故障崩溃，抛出异常以激活 3 次重试或回滚
-            raise ValueError("所有并行提取器皆运行失败，提取主任务异常。")
+            # 所有提取器均因接口故障崩溃，应保留 raw_posts.is_analyzed=0 供下轮重试。
+            raise TransientLLMError("所有并行提取器皆运行失败，提取主任务暂时不可用。")
             
         # 统计并累加所有提取器提取到的候选活动总数
         total_extracted_candidates = sum(len(out["event_list"]) for out in valid_outputs)
@@ -245,14 +244,14 @@ async def analyze_candidate_posts(candidate_name: str, posts: list[dict]) -> dic
     
     verify_agent = Agent(
         name="candidate_verify_agent",
-        instructions="你是一个二次元 Cosplay 专家审查员。根据用户提供的博主姓名及最近博文列表，进行客观评估，判断该博主是否是一个真实的、活跃的 Coser。必须严格遵循规定的 Pydantic 强契约输出。",
+        instructions=get_rendered_instructions("candidate_verify.jinja2"),
         output_type=CandidateVerifyOutput,
         model=model_spec
     )
     
     # 渲染输入模板
     input_prompt = render_instruction_template(
-        "candidate_verify.jinja2",
+        "candidate_verify_input.jinja2",
         candidate_name=candidate_name,
         posts=posts
     )

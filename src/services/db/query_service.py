@@ -1,6 +1,7 @@
 import sqlite3
 import datetime
 from src.models.db_models import get_db_connection
+from src.utils.time import beijing_today_str
 
 class QueryService:
     @staticmethod
@@ -32,8 +33,7 @@ class QueryService:
                 params.append(city)
             
             if scope == "future":
-                beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-                current_date = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d")
+                current_date = beijing_today_str()
                 sql += " AND (ce.event_date >= ? OR ce.event_date = '未知')"
                 params.append(current_date)
                 
@@ -225,8 +225,7 @@ class QueryService:
                 params.append(city)
                 
             if scope == "future":
-                beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-                current_date = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d")
+                current_date = beijing_today_str()
                 sql += " AND (end_date >= ? OR end_date IS NULL)"
                 params.append(current_date)
                 

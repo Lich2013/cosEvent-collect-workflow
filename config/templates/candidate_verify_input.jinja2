@@ -1,0 +1,8 @@
+待审查候选人姓名：{{ candidate_name }}
+
+博主最近的博文列表：
+{% for post in posts %}
+---
+博文 [{{ post.platform }}] (发布时间: {{ post.published_at }}):
+{{ post.content }}
+{% endfor %}

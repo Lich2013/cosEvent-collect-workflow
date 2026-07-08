@@ -1,6 +1,6 @@
-import datetime
 from jinja2 import Template
 from src.config import settings
+from src.utils.time import beijing_today_str
 
 def render_instruction_template(template_name: str, **kwargs) -> str:
     """
@@ -16,9 +16,5 @@ def render_instruction_template(template_name: str, **kwargs) -> str:
         
     template = Template(template_str)
     
-    # 自动注入北京时间 current_date 作为参考时间
-    beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-    current_date = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d")
-    
-    context = {"current_date": current_date, **kwargs}
+    context = {"current_date": beijing_today_str(), **kwargs}
     return template.render(**context)

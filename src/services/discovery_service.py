@@ -503,11 +503,11 @@ class DiscoveryService:
                     "reason": "博文抓取异常"
                 }
 
-            # 5. 没有博文数据且爬取没有发生异常，判定为非 Coser 忽略
+            # 5. 没有博文数据时无法确认是真空账号还是抓取降级，保守保留 pending。
             return {
                 "cand": cand,
-                "action": "reject",
-                "reject_reason": "NO_POSTS_AND_BIO_FAILED"
+                "action": "keep_pending",
+                "reason": "无可核验博文证据"
             }
 
         # 引入 Semaphore 限频大模型请求 (Semaphore concurrency limit of 5)
