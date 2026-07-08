@@ -108,24 +108,53 @@ class WorkflowOrchestrator:
 
             # 3. 小红书抓取
             if platform in ("xhs", "all"):
-                for idx, c in enumerate(target_xhs_cosers):
-                    if idx > 0:
-                        import random
-                        delay = random.uniform(7.0, 10.0)
-                        print(f"\x1b[1;36m[Orchestrator] 针对小红书数据源进行频控休眠: {delay:.1f}s...\x1b[0m")
-                        await asyncio.sleep(delay)
-                    processed_coser_ids.add(c["id"])
-                    success_platforms["xhs"]["total"] += 1
+                if target_xhs_cosers:
                     try:
-                        posts = await xhs_sc.fetch_xhs_posts(c["xhs_uid"], limit)
+                        batch_results = await xhs_sc.fetch_xhs_posts_batch(target_xhs_cosers, limit)
+                    except AttributeError:
+                        batch_results = []
+                        for c in target_xhs_cosers:
+                            posts = await xhs_sc.fetch_xhs_posts(c["xhs_uid"], limit)
+                            batch_results.append({
+                                "coser": c,
+                                "posts": posts,
+                                "status": getattr(xhs_sc, "last_scrape_status", "success") or "success",
+                                "error": getattr(xhs_sc, "last_scrape_error", None),
+                            })
+
+                    handled_ids = set()
+                    for item in batch_results:
+                        c = item["coser"]
+                        handled_ids.add(c["id"])
+                        processed_coser_ids.add(c["id"])
+                        success_platforms["xhs"]["total"] += 1
+                        scrape_status = item.get("status") or "success"
+                        scrape_error = item.get("error")
+                        posts = item.get("posts") or []
                         if posts:
                             ins = DBService.save_raw_posts(c["id"], "xhs", posts, conn=db_conn)
                             total_inserted += ins
-                        success_platforms["xhs"]["success"] += 1
-                    except Exception as e:
-                        log_event("ERROR", "scraper_xhs", f"Coser [{c['name']}] 小红书抓取失败: {e}", str(e))
-                    finally:
-                        DBService.update_scrape_timestamp(c["id"], "xhs", conn=db_conn)
+                        if scrape_status in ("success", "empty_bio"):
+                            success_platforms["xhs"]["success"] += 1
+                        DBService.update_scrape_timestamp(
+                            c["id"],
+                            "xhs",
+                            conn=db_conn,
+                            status=scrape_status,
+                            error=scrape_error
+                        )
+                        if scrape_status == "rate_limited":
+                            print("\x1b[1;33m[Orchestrator] 小红书已触发平台级冷却，本轮跳过后续小红书账号。\x1b[0m")
+                            break
+
+                    skipped_after_pause = False
+                    for c in target_xhs_cosers:
+                        if c["id"] in handled_ids:
+                            continue
+                        if skipped_after_pause:
+                            continue
+                        skipped_after_pause = True
+                        print("\x1b[1;33m[Orchestrator] 小红书批次提前结束，后续账号留待下一轮调度。\x1b[0m")
 
         finally:
             db_conn.close()

@@ -2,6 +2,7 @@ import sqlite3
 import datetime
 from src.models.db_models import get_db_connection
 from src.utils.logger import log_event
+from src.utils.time import beijing_now_str
 
 class CoserRepository:
     @staticmethod
@@ -94,8 +95,7 @@ class CoserRepository:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
             cursor.execute(
                 "INSERT INTO cosers (name, weibo_uid, bilibili_uid, xhs_uid, created_at) VALUES (?, ?, ?, ?, ?);",
                 (name, weibo_uid, bilibili_uid, xhs_uid, now_str)
@@ -155,15 +155,33 @@ class CoserRepository:
                 platform_uid_col = f"{platform}_uid"
                 cond = f"({platform_uid_col} IS NOT NULL AND {platform_uid_col} != '' AND {platform_uid_col} != '-')"
 
-            query = f"""
-                SELECT id, name, weibo_uid, bilibili_uid, xhs_uid, is_active, created_at, last_scraped_at
-                FROM cosers
-                WHERE is_active = 1 
-                  AND {cond}
-                ORDER BY last_scraped_at ASC
-                LIMIT ?;
-            """
-            cursor.execute(query, (limit,))
+            now_str = beijing_now_str()
+            if platform == "all":
+                query = f"""
+                    SELECT id, name, weibo_uid, bilibili_uid, xhs_uid, is_active, created_at, last_scraped_at,
+                           NULL AS last_scrape_status, NULL AS last_scrape_error, NULL AS next_retry_after
+                    FROM cosers
+                    WHERE is_active = 1 
+                      AND {cond}
+                    ORDER BY last_scraped_at ASC
+                    LIMIT ?;
+                """
+                cursor.execute(query, (limit,))
+            else:
+                query = f"""
+                    SELECT c.id, c.name, c.weibo_uid, c.bilibili_uid, c.xhs_uid, c.is_active, c.created_at,
+                           COALESCE(s.last_scraped_at, c.last_scraped_at) AS schedule_last_scraped_at,
+                           s.last_scrape_status, s.last_scrape_error, s.next_retry_after
+                    FROM cosers c
+                    LEFT JOIN coser_scrape_state s
+                      ON s.coser_id = c.id AND s.platform = ?
+                    WHERE c.is_active = 1 
+                      AND {cond}
+                      AND (s.next_retry_after IS NULL OR s.next_retry_after <= ?)
+                    ORDER BY schedule_last_scraped_at ASC
+                    LIMIT ?;
+                """
+                cursor.execute(query, (platform, now_str, limit))
             rows = cursor.fetchall()
             return [
                 {
@@ -174,7 +192,10 @@ class CoserRepository:
                     "xhs_uid": r[4],
                     "is_active": r[5],
                     "created_at": r[6],
-                    "last_scraped_at": r[7]
+                    "last_scraped_at": r[7],
+                    "last_scrape_status": r[8],
+                    "last_scrape_error": r[9],
+                    "next_retry_after": r[10]
                 } for r in rows
             ]
         finally:
@@ -183,14 +204,30 @@ class CoserRepository:
                 local_conn.close()
 
     @staticmethod
-    def update_scrape_timestamp(coser_id: int, platform: str = None, conn=None) -> bool:
+    def _cooldown_until(status: str | None) -> str | None:
+        if not status:
+            return None
+        minutes_map = {
+            "timeout": 30,
+            "unknown_schema": 120,
+            "auth_invalid": 360,
+            "rate_limited": 360,
+            "not_found_or_private": 1440,
+        }
+        minutes = minutes_map.get(status)
+        if minutes is None:
+            return None
+        now = datetime.datetime.strptime(beijing_now_str(), "%Y-%m-%d %H:%M:%S")
+        return (now + datetime.timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def update_scrape_timestamp(coser_id: int, platform: str = None, conn=None, status: str = "success", error: str = None, next_retry_after: str = None) -> bool:
         """更新对应平台的爬取时间戳"""
         local_conn = conn or get_db_connection()
         cursor = local_conn.cursor()
         try:
-            import datetime
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
+            retry_after = next_retry_after if next_retry_after is not None else CoserRepository._cooldown_until(status)
             cursor.execute(
                 """
                 UPDATE cosers
@@ -199,6 +236,20 @@ class CoserRepository:
                 """,
                 (now_str, coser_id)
             )
+            if platform:
+                cursor.execute(
+                    """
+                    INSERT INTO coser_scrape_state (
+                        coser_id, platform, last_scraped_at, last_scrape_status, last_scrape_error, next_retry_after
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(coser_id, platform) DO UPDATE SET
+                        last_scraped_at = excluded.last_scraped_at,
+                        last_scrape_status = excluded.last_scrape_status,
+                        last_scrape_error = excluded.last_scrape_error,
+                        next_retry_after = excluded.next_retry_after;
+                    """,
+                    (coser_id, platform, now_str, status, error, retry_after)
+                )
             local_conn.commit()
             return True
         except Exception as e:
@@ -307,8 +358,7 @@ class CoserRepository:
         cursor = local_conn.cursor()
         inserted_count = 0
         try:
-            beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-            now_str = datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+            now_str = beijing_now_str()
             for post in posts:
                 post_id = post["post_id"]
                 content = post["content"]

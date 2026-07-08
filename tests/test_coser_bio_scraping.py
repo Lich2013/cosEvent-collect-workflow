@@ -488,6 +488,406 @@ async def test_xhs_bio_scraping_rate_limit_bypasses_storage_state():
         mock_context.storage_state.assert_not_called()
 
 
+def test_xhs_otherinfo_health_classification():
+    """小红书 otherinfo 业务响应应能稳定分类所有健康状态。"""
+    scraper = XhsScraper()
+
+    cases = [
+        ({"data": {"desc": "上海CP30"}}, "healthy", "上海CP30"),
+        ({"data": {"desc": "  "}}, "empty_bio", ""),
+        ({"code": -1, "msg": "请先登录"}, "auth_invalid", ""),
+        ({"code": -1, "msg": "访问频繁，请完成验证码"}, "rate_limited", ""),
+        ({"code": -1, "msg": "用户不存在或私密"}, "not_found_or_private", ""),
+        ({"foo": "bar"}, "unknown_schema", ""),
+    ]
+
+    for payload, expected_status, expected_bio in cases:
+        status, bio, summary = scraper.classify_otherinfo_response(payload)
+        assert status == expected_status
+        assert bio == expected_bio
+        assert "keys=" in summary
+
+
+@pytest.mark.asyncio
+async def test_xhs_page_state_classification():
+    """页面状态检测覆盖登录、验证、访问频繁、用户不可见和正常页面。"""
+    scraper = XhsScraper()
+
+    async def classify(url, body):
+        page = MagicMock()
+        page.url = url
+        locator = MagicMock()
+        locator.inner_text = AsyncMock(return_value=body)
+        page.locator.return_value = locator
+        return await scraper.classify_page_state(page)
+
+    assert (await classify("https://www.xiaohongshu.com/login", ""))[0] == "auth_invalid"
+    assert (await classify("https://www.xiaohongshu.com/website-login/captcha?redirectPath=/user/profile/u", ""))[0] == "rate_limited"
+    assert (await classify("https://www.xiaohongshu.com/user/profile/u", "请完成滑块安全验证"))[0] == "rate_limited"
+    assert (await classify("https://www.xiaohongshu.com/user/profile/u", "访问频繁，请稍后再试"))[0] == "rate_limited"
+    assert (await classify("https://www.xiaohongshu.com/user/profile/u", "用户不存在或内容无法查看"))[0] == "not_found_or_private"
+    assert (await classify("https://www.xiaohongshu.com/user/profile/u", "普通用户主页内容"))[0] == "unknown_schema"
+
+
+@pytest.mark.asyncio
+async def test_xhs_session_health_error_blocks_writeback(tmp_path):
+    """小红书业务级非健康状态应禁止 state.json 和种子 Cookie 回写。"""
+    from src.tools.playwright_base import SessionHealthError
+
+    scraper = XhsScraper()
+    scraper.state_file = tmp_path / "state.json"
+    scraper.seed_file = tmp_path / "xhs_cookies.json"
+    scraper.seed_file.write_text("web_session=s; a1=a; websectiga=w; xsecappid=x", encoding="utf-8")
+
+    mock_context = MagicMock()
+    mock_context.set_default_timeout = MagicMock()
+    mock_context.add_cookies = AsyncMock()
+    mock_context.close = AsyncMock()
+    mock_context.storage_state = AsyncMock()
+    mock_context.cookies = AsyncMock(return_value=[])
+
+    mock_browser = MagicMock()
+    mock_browser.new_context = AsyncMock(return_value=mock_context)
+    mock_browser.close = AsyncMock()
+    mock_chromium = MagicMock()
+    mock_chromium.launch = AsyncMock(return_value=mock_browser)
+    mock_p = MagicMock()
+    mock_p.chromium = mock_chromium
+
+    class MockAsyncPlaywrightContext:
+        async def __aenter__(self):
+            return mock_p
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    async def mock_work_func(context):
+        scraper._set_status("auth_invalid", "请先登录")
+        raise SessionHealthError("小红书 otherinfo 非健康响应: auth_invalid")
+
+    with patch("src.tools.playwright_base.async_playwright", return_value=MockAsyncPlaywrightContext()), \
+         patch.object(scraper, "_check_state_cookies_expired", return_value=True):
+        result = await scraper.scrape_flow_handler(mock_work_func)
+
+    assert result == []
+    assert scraper.skip_state_write is True
+    assert scraper.skip_seed_write is True
+    mock_context.storage_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_xhs_missing_key_cookie_blocks_seed_write(tmp_path):
+    """健康抓取后若缺少小红书关键 Cookie，不应覆盖种子文件。"""
+    scraper = XhsScraper()
+    scraper.state_file = tmp_path / "state.json"
+    scraper.seed_file = tmp_path / "xhs_cookies.json"
+    scraper.seed_file.write_text("original", encoding="utf-8")
+    scraper.mark_session_healthy()
+
+    mock_context = MagicMock()
+    mock_context.storage_state = AsyncMock()
+    mock_context.cookies = AsyncMock(return_value=[
+        {"name": "web_session", "value": "s"},
+        {"name": "a1", "value": "a"},
+        {"name": "websectiga", "value": "w"},
+    ])
+
+    with patch.object(scraper, "update_seed_cookies") as mock_update_seed:
+        await scraper._write_session_state(mock_context)
+
+    mock_context.storage_state.assert_awaited_once_with(path=str(scraper.state_file))
+    mock_update_seed.assert_not_called()
+    assert scraper.seed_file.read_text(encoding="utf-8") == "original"
+
+
+@pytest.mark.asyncio
+async def test_playwright_launch_uses_headless_setting():
+    """Playwright headless 开关应从 settings.yaml 映射出的 settings 读取。"""
+    scraper = XhsScraper()
+    mock_playwright = MagicMock()
+    mock_playwright.chromium.launch = AsyncMock(return_value=MagicMock())
+    original = settings.playwright_headless
+    settings.playwright_headless = False
+    try:
+        await scraper._launch_browser(mock_playwright)
+    finally:
+        settings.playwright_headless = original
+
+    mock_playwright.chromium.launch.assert_awaited_once_with(
+        headless=False,
+        args=["--disable-blink-features=AutomationControlled"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_xhs_batch_reuses_context_and_waits_between_accounts():
+    """批次抓取应在同一个上下文中顺序访问账号并插入账号间等待。"""
+    scraper = XhsScraper()
+    mock_context = MagicMock()
+    items = [
+        {"id": 1, "name": "A", "xhs_uid": "u1"},
+        {"id": 2, "name": "B", "xhs_uid": "u2"},
+    ]
+
+    async def fake_batch_flow(work_func, batch_items, limit):
+        return await work_func(mock_context, batch_items, limit)
+
+    async def fake_fetch(context, uid, limit, prewarm=True):
+        assert context is mock_context
+        return [{"post_id": f"bio_{uid}", "content": "[个人简介] test", "post_url": "u", "edit_count": 0, "published_at": "2026-01-01 00:00:00"}]
+
+    with patch.object(scraper, "scrape_batch_flow_handler", side_effect=fake_batch_flow), \
+         patch.object(scraper, "fetch_xhs_posts_with_context", side_effect=fake_fetch) as mock_fetch, \
+         patch.object(scraper, "natural_wait", new=AsyncMock()) as mock_wait:
+        results = await scraper.fetch_xhs_posts_batch(items, limit=5)
+
+    assert [r["coser"]["id"] for r in results] == [1, 2]
+    assert mock_fetch.await_count == 2
+    mock_wait.assert_awaited_once_with(7.0, 10.0)
+
+
+@pytest.mark.asyncio
+async def test_xhs_batch_long_pause_after_success_threshold():
+    """小红书批次达到成功阈值后，应在下一个账号前执行长暂停。"""
+    scraper = XhsScraper()
+    mock_context = MagicMock()
+    items = [
+        {"id": 1, "name": "A", "xhs_uid": "u1"},
+        {"id": 2, "name": "B", "xhs_uid": "u2"},
+        {"id": 3, "name": "C", "xhs_uid": "u3"},
+    ]
+
+    async def fake_batch_flow(work_func, batch_items, limit):
+        return await work_func(mock_context, batch_items, limit)
+
+    async def fake_fetch(context, uid, limit, prewarm=True):
+        scraper._set_status("success")
+        return [{"post_id": f"bio_{uid}", "content": "[个人简介] test", "post_url": "u", "edit_count": 0, "published_at": "2026-01-01 00:00:00"}]
+
+    original_every = settings.xhs_long_pause_every_successes
+    original_min = settings.xhs_long_pause_min_seconds
+    original_max = settings.xhs_long_pause_max_seconds
+    settings.xhs_long_pause_every_successes = 2
+    settings.xhs_long_pause_min_seconds = 30.0
+    settings.xhs_long_pause_max_seconds = 60.0
+    try:
+        with patch.object(scraper, "scrape_batch_flow_handler", side_effect=fake_batch_flow), \
+             patch.object(scraper, "fetch_xhs_posts_with_context", side_effect=fake_fetch), \
+             patch.object(scraper, "natural_wait", new=AsyncMock()) as mock_wait:
+            results = await scraper.fetch_xhs_posts_batch(items, limit=5)
+    finally:
+        settings.xhs_long_pause_every_successes = original_every
+        settings.xhs_long_pause_min_seconds = original_min
+        settings.xhs_long_pause_max_seconds = original_max
+
+    assert len(results) == 3
+    assert mock_wait.await_args_list[0].args == (7.0, 10.0)
+    assert mock_wait.await_args_list[1].args == (7.0, 10.0)
+    assert mock_wait.await_args_list[2].args == (30.0, 60.0)
+
+
+@pytest.mark.asyncio
+async def test_xhs_default_path_waits_for_page_triggered_otherinfo():
+    """默认路径应等待页面自然触发 otherinfo，不使用 Python HTTP 客户端兜底。"""
+    scraper = XhsScraper()
+    mock_resp_otherinfo = MagicMock()
+    mock_resp_otherinfo.url = "https://www.xiaohongshu.com/api/sns/web/v1/user/otherinfo?target_user_id=789"
+    mock_resp_otherinfo.status = 200
+    mock_resp_otherinfo.json = AsyncMock(return_value={"data": {"desc": "自然触发的简介"}})
+
+    mock_page = MagicMock()
+    mock_page.goto = AsyncMock()
+    mock_page.expect_response = MagicMock(return_value=MockExpectResponseContext(mock_resp_otherinfo))
+    mock_page.on = MagicMock()
+    mock_locator = AsyncMock()
+    mock_locator.is_visible.return_value = False
+    mock_page.locator.return_value = mock_locator
+    mock_page.mouse.wheel = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.new_page = AsyncMock(return_value=mock_page)
+    mock_context.request.get = AsyncMock()
+
+    with patch.object(scraper, "prewarm_page", new=AsyncMock()), \
+         patch.object(scraper, "natural_wait", new=AsyncMock()), \
+         patch("urllib.request.urlopen") as mock_urlopen:
+        posts = await scraper.fetch_xhs_posts_with_context(mock_context, "789", limit=5)
+
+    assert posts[0]["post_id"] == "bio_789"
+    mock_page.expect_response.assert_called_once()
+    mock_page.goto.assert_awaited_once_with("https://www.xiaohongshu.com/user/profile/789")
+    mock_context.request.get.assert_not_called()
+    mock_urlopen.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_seed_cookie_newer_bypasses_state(tmp_path):
+    """种子 Cookie 文件比 state 新时，应旁路旧 storage_state 并注入种子 Cookie。"""
+    scraper = WeiboScraper()
+    scraper.state_file = tmp_path / "state.json"
+    scraper.seed_file = tmp_path / "weibo_cookies.json"
+    scraper.state_file.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+    scraper.seed_file.write_text("SUB=new; SUBP=new; WBPSESS=new; XSRF-TOKEN=new", encoding="utf-8")
+
+    old_time = datetime.datetime.now().timestamp() - 60
+    new_time = datetime.datetime.now().timestamp()
+    os.utime(scraper.state_file, (old_time, old_time))
+    os.utime(scraper.seed_file, (new_time, new_time))
+
+    mock_context = MagicMock()
+    mock_context.set_default_timeout = MagicMock()
+    mock_context.add_cookies = AsyncMock()
+    mock_browser = MagicMock()
+    mock_browser.new_context = AsyncMock(return_value=mock_context)
+
+    with patch.object(scraper, "_check_state_cookies_expired", return_value=False):
+        context = await scraper.get_browser_context(mock_browser)
+
+    assert context is mock_context
+    assert scraper.context_source == "seed"
+    mock_browser.new_context.assert_called_once()
+    kwargs = mock_browser.new_context.call_args.kwargs
+    assert "storage_state" not in kwargs
+    mock_context.add_cookies.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_weibo_unhealthy_mymblog_blocks_writeback(tmp_path):
+    """微博 mymblog 非健康响应应触发会话健康异常并禁止回写。"""
+    from src.tools.playwright_base import SessionHealthError
+
+    scraper = WeiboScraper()
+    scraper.state_file = tmp_path / "state.json"
+    scraper.seed_file = tmp_path / "weibo_cookies.json"
+
+    with pytest.raises(SessionHealthError):
+        scraper._assert_mymblog_healthy({"ok": 0, "msg": "未登录", "data": None})
+
+    assert scraper.skip_state_write is True
+    assert scraper.skip_seed_write is True
+    assert scraper.session_health_verified is False
+
+
+@pytest.mark.asyncio
+async def test_weibo_state_unhealthy_retries_with_seed_and_writes_when_healthy(tmp_path):
+    """state 业务级失效后，应使用种子 Cookie 重试一次，重试健康后允许回写。"""
+    from src.tools.playwright_base import SessionHealthError
+
+    scraper = WeiboScraper()
+    scraper.state_file = tmp_path / "state.json"
+    scraper.seed_file = tmp_path / "weibo_cookies.json"
+    scraper.state_file.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+    scraper.seed_file.write_text("SUB=s; SUBP=s; WBPSESS=s; XSRF-TOKEN=s", encoding="utf-8")
+    new_time = datetime.datetime.now().timestamp()
+    old_time = new_time - 60
+    os.utime(scraper.seed_file, (old_time, old_time))
+    os.utime(scraper.state_file, (new_time, new_time))
+
+    state_context = MagicMock()
+    state_context.set_default_timeout = MagicMock()
+    state_context.close = AsyncMock()
+    state_context.storage_state = AsyncMock()
+
+    seed_context = MagicMock()
+    seed_context.set_default_timeout = MagicMock()
+    seed_context.add_cookies = AsyncMock()
+    seed_context.close = AsyncMock()
+    seed_context.storage_state = AsyncMock()
+    seed_context.cookies = AsyncMock(return_value=[
+        {"name": "SUB", "value": "s"},
+        {"name": "SUBP", "value": "s"},
+        {"name": "WBPSESS", "value": "s"},
+        {"name": "XSRF-TOKEN", "value": "s"},
+    ])
+
+    mock_browser = MagicMock()
+    mock_browser.new_context = AsyncMock(side_effect=[state_context, seed_context])
+    mock_browser.close = AsyncMock()
+    mock_chromium = MagicMock()
+    mock_chromium.launch = AsyncMock(return_value=mock_browser)
+    mock_p = MagicMock()
+    mock_p.chromium = mock_chromium
+
+    class MockAsyncPlaywrightContext:
+        async def __aenter__(self):
+            return mock_p
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    calls = 0
+    async def mock_work_func(context):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SessionHealthError("mymblog 非健康响应: auth_invalid")
+        scraper.mark_session_healthy()
+        return [{"post_id": "ok"}]
+
+    with patch("src.tools.playwright_base.async_playwright", return_value=MockAsyncPlaywrightContext()), \
+         patch.object(scraper, "_check_state_cookies_expired", return_value=False), \
+         patch.object(scraper, "update_seed_cookies") as mock_update_seed:
+        result = await scraper.scrape_flow_handler(mock_work_func)
+
+    assert result == [{"post_id": "ok"}]
+    assert calls == 2
+    state_context.storage_state.assert_not_called()
+    seed_context.storage_state.assert_awaited_once_with(path=str(scraper.state_file))
+    mock_update_seed.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_weibo_state_and_seed_unhealthy_do_not_writeback(tmp_path):
+    """state 与种子 Cookie 都无法通过微博健康检查时，应返回空列表且不回写。"""
+    from src.tools.playwright_base import SessionHealthError
+
+    scraper = WeiboScraper()
+    scraper.state_file = tmp_path / "state.json"
+    scraper.seed_file = tmp_path / "weibo_cookies.json"
+    scraper.state_file.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+    scraper.seed_file.write_text("SUB=s; SUBP=s; WBPSESS=s; XSRF-TOKEN=s", encoding="utf-8")
+    new_time = datetime.datetime.now().timestamp()
+    old_time = new_time - 60
+    os.utime(scraper.seed_file, (old_time, old_time))
+    os.utime(scraper.state_file, (new_time, new_time))
+
+    state_context = MagicMock()
+    state_context.set_default_timeout = MagicMock()
+    state_context.close = AsyncMock()
+    state_context.storage_state = AsyncMock()
+
+    seed_context = MagicMock()
+    seed_context.set_default_timeout = MagicMock()
+    seed_context.add_cookies = AsyncMock()
+    seed_context.close = AsyncMock()
+    seed_context.storage_state = AsyncMock()
+
+    mock_browser = MagicMock()
+    mock_browser.new_context = AsyncMock(side_effect=[state_context, seed_context])
+    mock_browser.close = AsyncMock()
+    mock_chromium = MagicMock()
+    mock_chromium.launch = AsyncMock(return_value=mock_browser)
+    mock_p = MagicMock()
+    mock_p.chromium = mock_chromium
+
+    class MockAsyncPlaywrightContext:
+        async def __aenter__(self):
+            return mock_p
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    async def mock_work_func(context):
+        raise SessionHealthError("mymblog 非健康响应: auth_invalid")
+
+    with patch("src.tools.playwright_base.async_playwright", return_value=MockAsyncPlaywrightContext()), \
+         patch.object(scraper, "_check_state_cookies_expired", return_value=False), \
+         patch.object(scraper, "update_seed_cookies") as mock_update_seed:
+        result = await scraper.scrape_flow_handler(mock_work_func)
+
+    assert result == []
+    state_context.storage_state.assert_not_called()
+    seed_context.storage_state.assert_not_called()
+    mock_update_seed.assert_not_called()
+
+
 def test_update_seed_cookies_formats(tmp_path):
     """测试 update_seed_cookies 方法在面对不同的原始种子格式时，能以对应的格式回写"""
     scraper = XhsScraper()
@@ -720,4 +1120,3 @@ async def test_bilibili_grpc_token_auto_refresh(tmp_path):
     # 8. 恢复原来的 settings 变量
     settings.bilibili_grpc_access_token = original_access
     settings.bilibili_grpc_refresh_token = original_refresh
-

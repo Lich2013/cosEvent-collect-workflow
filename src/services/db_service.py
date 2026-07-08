@@ -27,8 +27,8 @@ class DBService:
         return CoserRepository.list_active_cosers_by_schedule(platform, limit, conn)
 
     @staticmethod
-    def update_scrape_timestamp(coser_id: int, platform: str, conn=None) -> bool:
-        return CoserRepository.update_scrape_timestamp(coser_id, platform, conn)
+    def update_scrape_timestamp(coser_id: int, platform: str, conn=None, status: str = "success", error: str = None, next_retry_after: str = None) -> bool:
+        return CoserRepository.update_scrape_timestamp(coser_id, platform, conn, status, error, next_retry_after)
 
 
     @staticmethod

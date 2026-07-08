@@ -13,6 +13,10 @@ class XhsRateLimitError(Exception):
     """小红书遭遇频控/验证码阻断异常"""
     pass
 
+class SessionHealthError(Exception):
+    """平台业务响应表明当前浏览器会话不可安全回写"""
+    pass
+
 class BaseScraper:
     def __init__(self, platform: str):
         self.platform = platform
@@ -21,6 +25,54 @@ class BaseScraper:
         
         # 确保运行状态目录存在
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.context_source = "empty"
+        self.force_seed_context = False
+        self.session_health_verified = self.platform != "weibo"
+        self.skip_state_write = False
+        self.skip_seed_write = False
+        self.skip_write_reason = ""
+
+    def _reset_session_flags(self):
+        self.context_source = "empty"
+        self.force_seed_context = False
+        self.session_health_verified = self.platform != "weibo"
+        self.skip_state_write = False
+        self.skip_seed_write = False
+        self.skip_write_reason = ""
+
+    def mark_session_healthy(self):
+        self.session_health_verified = True
+
+    def mark_session_unhealthy(self, reason: str):
+        self.session_health_verified = False
+        self.skip_state_write = True
+        self.skip_seed_write = True
+        self.skip_write_reason = reason
+
+    def _seed_is_newer_than_state(self) -> bool:
+        if not self.seed_file.exists() or not self.state_file.exists():
+            return False
+        try:
+            return self.seed_file.stat().st_mtime > self.state_file.stat().st_mtime
+        except Exception:
+            return False
+
+    def _has_required_cookies(self, cookies: list[dict]) -> bool:
+        required_by_platform = {
+            "weibo": ["SUB", "SUBP", "WBPSESS", "XSRF-TOKEN"],
+            "xhs": ["web_session", "a1", "websectiga", "xsecappid"],
+        }
+        required = required_by_platform.get(self.platform)
+        if not required:
+            return bool(cookies)
+        cookies_map = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+        missing = [name for name in required if not cookies_map.get(name)]
+        if missing:
+            msg = f"缺少关键 Cookie: {', '.join(missing)}，跳过种子 Cookie 回写。"
+            print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] {msg}\x1b[0m")
+            log_event("WARNING", f"scraper_{self.platform}", msg)
+            return False
+        return True
 
     def update_seed_cookies(self, cookies: list[dict]):
         """根据当前有效 cookies 同步更新回写到静态种子文件"""
@@ -156,9 +208,20 @@ class BaseScraper:
         context = None
         user_agent_val = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
         viewport_val = {"width": 1280, "height": 800}
+        bypass_state = self.force_seed_context
+
+        if not bypass_state and self._seed_is_newer_than_state():
+            bypass_state = True
+            msg = "检测到种子 Cookie 文件比 state.json 更新，优先使用种子 Cookie 冷启动。"
+            print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] {msg}\x1b[0m")
+            log_event("WARNING", f"scraper_{self.platform}", msg)
         
+        state_expired = False
+        if not bypass_state and self.state_file.exists():
+            state_expired = self._check_state_cookies_expired()
+
         # 1. 优先尝试从本地 state.json 恢复会话（先检查 cookie 是否过期）
-        if self.state_file.exists() and not self._check_state_cookies_expired():
+        if not bypass_state and self.state_file.exists() and not state_expired:
             try:
                 context = await browser.new_context(
                     storage_state=str(self.state_file),
@@ -167,11 +230,13 @@ class BaseScraper:
                 )
                 # 设置页面 15s 严格加载超时
                 context.set_default_timeout(settings.page_load_timeout_seconds * 1000)
+                self.context_source = "state"
+                print(f"\x1b[1;32m[Scraper] [{self.platform}] 已从 state.json 恢复浏览器会话。\x1b[0m")
                 return context
             except (json.JSONDecodeError, Exception) as e:
                 # 本地 state.json 损坏或失效，执行删除恢复并友好降级到种子 Cookie
                 print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] 持久化 state.json 损坏或无法读取({e})，正在自动删除并降级冷启动...\x1b[0m")
-        else:
+        elif state_expired:
             # state.json 不存在或 cookie 已过期，删除以触发种子 Cookie 重建
             if self.state_file.exists():
                 print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] state.json 中 cookie 已过期，自动删除并降级到种子 Cookie。\x1b[0m")
@@ -190,11 +255,46 @@ class BaseScraper:
         if seed_cookies:
             try:
                 await context.add_cookies(seed_cookies)
+                self.context_source = "seed"
                 print(f"\x1b[1;32m[Scraper] [{self.platform}] 成功注入 {len(seed_cookies)} 条静态种子 Cookie。\x1b[0m")
             except Exception as e:
                 print(f"\x1b[1;31m[Scraper ERROR] [{self.platform}] 注入种子 Cookie 失败: {e}\x1b[0m")
+        else:
+            self.context_source = "empty"
         
         return context
+
+    async def _safe_close_context(self, context: BrowserContext | None):
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+    async def _write_session_state(self, context: BrowserContext):
+        if self.skip_state_write or not self.session_health_verified:
+            reason = self.skip_write_reason or "会话健康状态未确认"
+            print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] 跳过 state.json 回写: {reason}\x1b[0m")
+            log_event("WARNING", f"scraper_{self.platform}", f"跳过 state.json 回写: {reason}")
+            return
+
+        cookies = await context.cookies()
+        if cookies:
+            if self.skip_seed_write:
+                reason = self.skip_write_reason or "会话健康状态未确认"
+                print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] 跳过种子 Cookie 回写: {reason}\x1b[0m")
+                log_event("WARNING", f"scraper_{self.platform}", f"跳过种子 Cookie 回写: {reason}")
+            elif self._has_required_cookies(cookies):
+                self.update_seed_cookies(cookies)
+
+        # state.json 必须最后写入，避免自动回写种子 Cookie 后 mtime 永远新于 state，导致下个账号反复冷启动。
+        await context.storage_state(path=str(self.state_file))
+
+    async def _launch_browser(self, playwright):
+        return await playwright.chromium.launch(
+            headless=settings.playwright_headless,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
 
     async def scrape_flow_handler(self, work_func, *args, **kwargs):
         """
@@ -207,29 +307,56 @@ class BaseScraper:
             browser = None
             context = None
             try:
+                self._reset_session_flags()
                 # 1. 无头模式运行
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"]
-                )
+                browser = await self._launch_browser(p)
                 
                 # 2. 加载浏览器上下文 (处理 state.json 损坏降级)
                 context = await self.get_browser_context(browser)
                 
                 # 3. 执行真正的具体平台爬取逻辑
-                result = await work_func(context, *args, **kwargs)
+                try:
+                    result = await work_func(context, *args, **kwargs)
+                except SessionHealthError as she:
+                    self.mark_session_unhealthy(str(she))
+                    if self.context_source == "state":
+                        msg = f"检测到 state 会话业务级失效，将使用种子 Cookie 冷启动重试一次: {she}"
+                        print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] {msg}\x1b[0m")
+                        log_event("WARNING", f"scraper_{self.platform}", msg, str(she))
+                        await self._safe_close_context(context)
+                        context = None
+                        try:
+                            if self.state_file.exists():
+                                self.state_file.unlink()
+                        except Exception as unlink_err:
+                            print(f"\x1b[1;31m[Scraper ERROR] [{self.platform}] 删除失效 state.json 失败: {unlink_err}\x1b[0m")
+                        self.force_seed_context = True
+                        self.skip_state_write = False
+                        self.skip_seed_write = False
+                        self.skip_write_reason = ""
+                        self.session_health_verified = self.platform != "weibo"
+                        context = await self.get_browser_context(browser)
+                        try:
+                            result = await work_func(context, *args, **kwargs)
+                        except SessionHealthError as retry_err:
+                            self.mark_session_unhealthy(str(retry_err))
+                            msg = f"种子 Cookie 冷启动重试后仍未通过会话健康检查，请人工刷新 Cookie: {retry_err}"
+                            print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] {msg}\x1b[0m")
+                            log_event("WARNING", f"scraper_{self.platform}", msg, str(retry_err))
+                            return []
+                    else:
+                        msg = f"会话健康检查失败，请人工刷新 Cookie: {she}"
+                        print(f"\x1b[1;33m[Scraper Warning] [{self.platform}] {msg}\x1b[0m")
+                        log_event("WARNING", f"scraper_{self.platform}", msg, str(she))
+                        return []
                 
                 # 4. 执行成功，回写最新的会话状态到 state.json
-                await context.storage_state(path=str(self.state_file))
-                
-                # 同步回写到静态种子配置文件
-                cookies = await context.cookies()
-                if cookies:
-                    self.update_seed_cookies(cookies)
+                await self._write_session_state(context)
                 
                 return result
                 
             except XhsRateLimitError as rle:
+                self.mark_session_unhealthy(str(rle))
                 err_msg = f"小红书遭遇频控限流/滑块验证，将跳过本轮会话回写以隔离缓存: {rle}"
                 print(f"\x1b[1;33m[Scraper RateLimit Warning] [{self.platform}] {err_msg}\x1b[0m")
                 log_event("WARNING", f"scraper_{self.platform}", err_msg, str(rle))
@@ -247,6 +374,44 @@ class BaseScraper:
                 return []
             finally:
                 # 5. 优雅关闭并释放浏览器资源
+                try:
+                    if context:
+                        await context.close()
+                    if browser:
+                        await browser.close()
+                except Exception:
+                    pass
+
+    async def scrape_batch_flow_handler(self, work_func, *args, **kwargs):
+        """Run multiple platform fetches inside one Browser/Context lifecycle."""
+        async with async_playwright() as p:
+            browser = None
+            context = None
+            try:
+                self._reset_session_flags()
+                browser = await self._launch_browser(p)
+                context = await self.get_browser_context(browser)
+                result = await work_func(context, *args, **kwargs)
+                await self._write_session_state(context)
+                return result
+            except XhsRateLimitError as rle:
+                self.mark_session_unhealthy(str(rle))
+                err_msg = f"小红书遭遇频控限流/滑块验证，将跳过本轮会话回写以隔离缓存: {rle}"
+                print(f"\x1b[1;33m[Scraper RateLimit Warning] [{self.platform}] {err_msg}\x1b[0m")
+                log_event("WARNING", f"scraper_{self.platform}", err_msg, str(rle))
+                return []
+            except (TimeoutError, PlaywrightTimeoutError) as te:
+                err_msg = f"页面在 {settings.page_load_timeout_seconds}s 内加载超时！优雅跳过当前批次抓取任务。"
+                print(f"\x1b[1;31m[Scraper Timeout ERROR] [{self.platform}] {err_msg}\x1b[0m")
+                log_event("ERROR", f"scraper_{self.platform}", err_msg, str(te))
+                return []
+            except Exception as e:
+                err_msg = f"发生运行时错误，批次抓取被中断: {e}"
+                print(f"\x1b[1;31m[Scraper Runtime ERROR] [{self.platform}] {err_msg}\x1b[0m")
+                traceback.print_exc()
+                log_event("ERROR", f"scraper_{self.platform}", err_msg, str(e))
+                return []
+            finally:
                 try:
                     if context:
                         await context.close()

@@ -91,6 +91,27 @@ def test_coser_last_scraped_at_update_and_cleanup():
     conn.close()
 
 
+def test_xhs_cooldown_filters_scheduled_accounts():
+    """小红书 next_retry_after 未到期时不应进入调度队列，到期后恢复。"""
+    assert DBService.add_coser("XhsCooldown", xhs_uid="xhs_cooldown") is True
+    coser = [c for c in DBService.list_cosers() if c["name"] == "XhsCooldown"][0]
+
+    assert DBService.update_scrape_timestamp(coser["id"], "xhs", status="rate_limited", error="访问频繁") is True
+    assert DBService.list_active_cosers_by_schedule("xhs", 10) == []
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE coser_scrape_state SET next_retry_after = ? WHERE coser_id = ? AND platform = 'xhs';",
+        ("2000-01-01 00:00:00", coser["id"])
+    )
+    conn.commit()
+    conn.close()
+
+    batch = DBService.list_active_cosers_by_schedule("xhs", 10)
+    assert [c["name"] for c in batch] == ["XhsCooldown"]
+
+
 @pytest.mark.asyncio
 async def test_scrape_failure_still_updates_timestamp():
     """测试当抓取抛出异常时，时间戳是否仍能够正常更新落盘"""

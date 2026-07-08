@@ -20,6 +20,10 @@ class Settings:
         self.db_path = str(self.PROJECT_ROOT / "runtime" / "cosevent.db")
         self.default_limit = 10
         self.page_load_timeout_seconds = 15
+        self.playwright_headless = True
+        self.xhs_long_pause_every_successes = 6
+        self.xhs_long_pause_min_seconds = 45.0
+        self.xhs_long_pause_max_seconds = 90.0
         self.analyze_confidence_threshold = 0.3
         self.auto_approve_candidates = True
         self.langfuse_host = "http://localhost:3000"
@@ -76,6 +80,10 @@ class Settings:
                         self.db_path = str(self.PROJECT_ROOT / db_rel)
                         self.default_limit = int(data.get("default_limit", self.default_limit))
                         self.page_load_timeout_seconds = int(data.get("page_load_timeout_seconds", self.page_load_timeout_seconds))
+                        self.playwright_headless = bool(data.get("playwright_headless", self.playwright_headless))
+                        self.xhs_long_pause_every_successes = int(data.get("xhs_long_pause_every_successes", self.xhs_long_pause_every_successes))
+                        self.xhs_long_pause_min_seconds = float(data.get("xhs_long_pause_min_seconds", self.xhs_long_pause_min_seconds))
+                        self.xhs_long_pause_max_seconds = float(data.get("xhs_long_pause_max_seconds", self.xhs_long_pause_max_seconds))
                         self.analyze_confidence_threshold = float(data.get("analyze_confidence_threshold", self.analyze_confidence_threshold))
                         self.auto_approve_candidates = bool(data.get("auto_approve_candidates", self.auto_approve_candidates))
                         self.langfuse_host = data.get("langfuse_host", self.langfuse_host)
@@ -170,4 +178,3 @@ class Settings:
 
 # 单例配置
 settings = Settings()
-

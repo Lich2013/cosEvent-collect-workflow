@@ -49,6 +49,12 @@ def _make_scraper_mocks():
 
     xhs_sc = MagicMock()
     xhs_sc.fetch_xhs_posts = AsyncMock(return_value=DUMMY_POSTS)
+    async def mock_xhs_batch(items, limit):
+        return [
+            {"coser": item, "posts": DUMMY_POSTS, "status": "success", "error": None}
+            for item in items
+        ]
+    xhs_sc.fetch_xhs_posts_batch = AsyncMock(side_effect=mock_xhs_batch)
 
     return weibo_sc, bili_sc, xhs_sc
 
@@ -105,7 +111,7 @@ class TestFullScrapeNoFilter:
         # 池咲misa 三平台都有 UID → 三个 scraper 都应被调用
         assert weibo_sc.fetch_weibo_posts.called
         assert bili_sc.fetch_bilibili_posts.called
-        assert xhs_sc.fetch_xhs_posts.called
+        assert xhs_sc.fetch_xhs_posts_batch.called
 
     def test_inserted_count_accumulated(self):
         # 两个 Coser：池咲misa 3平台 + 北の雪狐 只有微博 → 4次成功 save_raw_posts → 4
@@ -140,7 +146,7 @@ class TestCoserNameFilter:
         result, weibo_sc, bili_sc, xhs_sc = _run_scrape_patched(ACTIVE_COSERS, coser_name="不存在的Coser")
         assert not weibo_sc.fetch_weibo_posts.called
         assert not bili_sc.fetch_bilibili_posts.called
-        assert not xhs_sc.fetch_xhs_posts.called
+        assert not xhs_sc.fetch_xhs_posts_batch.called
 
 
 # ---------------------------------------------------------------------------
@@ -152,20 +158,20 @@ class TestPlatformFilter:
         """--platform bilibili → 微博 Scraper 不应被调用"""
         result, weibo_sc, bili_sc, xhs_sc = _run_scrape_patched(ACTIVE_COSERS, platform="bilibili")
         assert not weibo_sc.fetch_weibo_posts.called
-        assert not xhs_sc.fetch_xhs_posts.called
+        assert not xhs_sc.fetch_xhs_posts_batch.called
         assert bili_sc.fetch_bilibili_posts.called
 
     def test_weibo_only_no_bili_call(self):
         result, weibo_sc, bili_sc, xhs_sc = _run_scrape_patched(ACTIVE_COSERS, platform="weibo")
         assert weibo_sc.fetch_weibo_posts.called
         assert not bili_sc.fetch_bilibili_posts.called
-        assert not xhs_sc.fetch_xhs_posts.called
+        assert not xhs_sc.fetch_xhs_posts_batch.called
 
     def test_xhs_only(self):
         result, weibo_sc, bili_sc, xhs_sc = _run_scrape_patched(ACTIVE_COSERS, platform="xhs")
         assert not weibo_sc.fetch_weibo_posts.called
         assert not bili_sc.fetch_bilibili_posts.called
-        assert xhs_sc.fetch_xhs_posts.called
+        assert xhs_sc.fetch_xhs_posts_batch.called
 
     def test_contract_tuple_shape_with_platform_filter(self):
         """平台过滤时，返回值仍应为三元组且 success_platforms 包含所有三个平台键"""
@@ -194,7 +200,7 @@ class TestCombinedFilter:
         assert total_inserted == 1
         assert bili_sc.fetch_bilibili_posts.call_count == 1
         assert not weibo_sc.fetch_weibo_posts.called
-        assert not xhs_sc.fetch_xhs_posts.called
+        assert not xhs_sc.fetch_xhs_posts_batch.called
 
     def test_single_coser_no_uid_for_platform(self):
         """北の雪狐 没有 B站 UID，--platform bilibili → 0 条入库"""
@@ -217,3 +223,37 @@ class TestEmptyCoserList:
         total_cosers, success_platforms, total_inserted = result
         assert total_cosers == 0
         assert total_inserted == 0
+
+
+def test_xhs_rate_limited_batch_pauses_following_accounts():
+    """小红书批次返回 rate_limited 后，调度器不应处理后续账号。"""
+    import asyncio
+    from src.services.workflow_orchestrator import WorkflowOrchestrator
+
+    cosers = [
+        {"id": 1, "name": "A", "weibo_uid": None, "bilibili_uid": None, "xhs_uid": "u1", "is_active": 1},
+        {"id": 2, "name": "B", "weibo_uid": None, "bilibili_uid": None, "xhs_uid": "u2", "is_active": 1},
+    ]
+    xhs_sc = MagicMock()
+    xhs_sc.fetch_xhs_posts_batch = AsyncMock(return_value=[
+        {"coser": cosers[0], "posts": [], "status": "rate_limited", "error": "访问频繁"}
+    ])
+
+    updated = []
+    def mock_update(coser_id, platform, conn=None, status="success", error=None, next_retry_after=None):
+        updated.append((coser_id, platform, status, error))
+        return True
+
+    with patch("src.services.workflow_orchestrator.DBService.list_active_cosers_by_schedule", return_value=cosers), \
+         patch("src.services.workflow_orchestrator.DBService.update_scrape_timestamp", side_effect=mock_update), \
+         patch("src.services.workflow_orchestrator.DBService.save_raw_posts", return_value=0), \
+         patch("src.services.workflow_orchestrator.XhsScraper", return_value=xhs_sc):
+        total_cosers, success_platforms, total_inserted = asyncio.run(
+            WorkflowOrchestrator.run_scrape(10, platform="xhs", batch_size=2)
+        )
+
+    assert total_cosers == 2
+    assert success_platforms["xhs"]["total"] == 1
+    assert success_platforms["xhs"]["success"] == 0
+    assert total_inserted == 0
+    assert updated == [(1, "xhs", "rate_limited", "访问频繁")]

@@ -219,6 +219,9 @@ def init_db():
             coser_id INTEGER NOT NULL,
             platform TEXT NOT NULL,
             last_scraped_at TEXT,
+            last_scrape_status TEXT,
+            last_scrape_error TEXT,
+            next_retry_after TEXT,
             PRIMARY KEY (coser_id, platform),
             FOREIGN KEY(coser_id) REFERENCES cosers(id) ON DELETE CASCADE
         );
@@ -294,6 +297,19 @@ def init_db():
                     );
                 """)
                 print("\x1b[1;32m[Database Migration] 成功从 coser_scrape_state 迁移历史时间戳。\x1b[0m")
+
+        # 自动为 coser_scrape_state 检测并追加平台级抓取状态字段
+        cursor.execute("PRAGMA table_info(coser_scrape_state);")
+        scrape_state_columns = [col[1] for col in cursor.fetchall()]
+        if "last_scrape_status" not in scrape_state_columns:
+            cursor.execute("ALTER TABLE coser_scrape_state ADD COLUMN last_scrape_status TEXT;")
+            print("\x1b[1;32m[Database Migration] 成功为 coser_scrape_state 表追加 last_scrape_status 列。\x1b[0m")
+        if "last_scrape_error" not in scrape_state_columns:
+            cursor.execute("ALTER TABLE coser_scrape_state ADD COLUMN last_scrape_error TEXT;")
+            print("\x1b[1;32m[Database Migration] 成功为 coser_scrape_state 表追加 last_scrape_error 列。\x1b[0m")
+        if "next_retry_after" not in scrape_state_columns:
+            cursor.execute("ALTER TABLE coser_scrape_state ADD COLUMN next_retry_after TEXT;")
+            print("\x1b[1;32m[Database Migration] 成功为 coser_scrape_state 表追加 next_retry_after 列。\x1b[0m")
             
         # 无条件执行存量 status_updated_at 数据兜底修复，防止影子表迁移或旧记录中遗留 NULL 值导致排序饥饿或冷却失效
         cursor.execute("UPDATE coser_candidates SET status_updated_at = created_at WHERE status_updated_at IS NULL;")

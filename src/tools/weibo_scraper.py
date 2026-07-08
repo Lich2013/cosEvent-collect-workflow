@@ -1,9 +1,85 @@
-from src.tools.playwright_base import BaseScraper
+from src.tools.playwright_base import BaseScraper, SessionHealthError
 from src.config import settings
+from src.utils.logger import log_event
 
 class WeiboScraper(BaseScraper):
     def __init__(self):
         super().__init__("weibo")
+
+    async def _fetch_edit_history(self, page, context, history_url: str, referer_url: str) -> dict:
+        """Fetch edit history in page context first so Referer/Origin/Cookie stay browser-native."""
+        try:
+            result = await page.evaluate(
+                """
+                async ({ url, timeoutMs }) => {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), timeoutMs);
+                    try {
+                        const res = await fetch(url, {
+                            credentials: 'include',
+                            headers: { accept: 'application/json, text/plain, */*' },
+                            signal: controller.signal
+                        });
+                        let data = null;
+                        try { data = await res.json(); } catch (_) {}
+                        return { ok: res.ok, status: res.status, data };
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }
+                """,
+                {"url": history_url, "timeoutMs": 8000}
+            )
+            if result and result.get("ok") and isinstance(result.get("data"), dict):
+                return result["data"]
+            log_event("WARNING", "scraper_weibo", f"页面上下文 editHistory 返回异常: status={result.get('status') if result else 'unknown'}")
+        except Exception as page_fetch_err:
+            log_event("WARNING", "scraper_weibo", f"页面上下文 editHistory 请求失败，尝试 APIRequestContext 兜底: {page_fetch_err}", str(page_fetch_err))
+
+        headers = {
+            "referer": referer_url,
+            "origin": "https://weibo.com",
+            "accept": "application/json, text/plain, */*",
+            "x-requested-with": "XMLHttpRequest",
+        }
+        history_resp = await context.request.get(history_url, headers=headers, timeout=8000)
+        if history_resp.ok:
+            return await history_resp.json()
+        return {}
+
+    def _classify_mymblog_response(self, content: dict) -> tuple[str, str]:
+        """返回微博 mymblog 业务健康状态，不记录任何 Cookie 敏感值。"""
+        if not isinstance(content, dict):
+            return "unknown_schema", "响应不是 JSON 对象"
+
+        keys = sorted(str(k) for k in content.keys())
+        ok_val = content.get("ok")
+        msg = str(content.get("msg") or content.get("message") or "")[:120]
+        data = content.get("data")
+
+        if isinstance(data, dict) and isinstance(data.get("list"), list):
+            return "healthy", f"keys={keys}, ok={ok_val}, list_len={len(data.get('list', []))}"
+
+        combined = f"{ok_val} {msg}".lower()
+        auth_tokens = ["login", "登录", "未登录", "权限", "auth", "passport", "forbidden"]
+        rate_tokens = ["verify", "验证", "风控", "captcha", "频繁", "risk", "安全"]
+        if any(token.lower() in combined for token in auth_tokens):
+            return "auth_invalid", f"keys={keys}, ok={ok_val}, msg={msg}"
+        if any(token.lower() in combined for token in rate_tokens):
+            return "rate_limited", f"keys={keys}, ok={ok_val}, msg={msg}"
+        if ok_val in (0, "0", False):
+            return "auth_invalid", f"keys={keys}, ok={ok_val}, msg={msg}"
+        return "unknown_schema", f"keys={keys}, ok={ok_val}, msg={msg}, data_type={type(data).__name__}"
+
+    def _assert_mymblog_healthy(self, content: dict):
+        status, summary = self._classify_mymblog_response(content)
+        log_event("INFO", "scraper_weibo", f"mymblog 健康分类: {status}; {summary}")
+        if status == "healthy":
+            self.mark_session_healthy()
+            return
+        reason = f"mymblog 非健康响应: {status}; {summary}"
+        self.mark_session_unhealthy(reason)
+        raise SessionHealthError(reason)
 
     async def fetch_weibo_posts(self, uid: str, limit: int = None) -> list[dict]:
         """抓取指定用户的微博动态列表"""
@@ -46,6 +122,8 @@ class WeiboScraper(BaseScraper):
             except Exception as e:
                 print(f"\x1b[1;33m[Scraper Warning] [weibo] 拦截 mymblog 失败 ({e})，尝试直接获取页面渲染\x1b[0m")
                 content = {}
+
+            self._assert_mymblog_healthy(content)
             
             if "data" in content and "list" in content["data"]:
                 for item in content["data"]["list"][:limit]:
@@ -79,17 +157,14 @@ class WeiboScraper(BaseScraper):
                         # 尝试通过 editHistory 接口抓取最新编辑版本的真实时间
                         # 使用 long id 作为 mid
                         history_url = f"https://weibo.com/ajax/statuses/editHistory?mid={item.get('id')}&page=1"
-                        headers = {"referer": f"https://weibo.com/u/{uid}"} # 这个接口有较为严格的反爬措施，会额外检查referer
                         try:
-                            history_resp = await context.request.get(history_url, headers=headers, timeout=3000)
-                            if history_resp.ok:
-                                history_json = await history_resp.json()
-                                statuses = history_json.get("statuses", [])
-                                if statuses and isinstance(statuses, list):
-                                    latest_edit_time_raw = statuses[0].get("created_at")
-                                    if latest_edit_time_raw:
-                                        dt = parsedate_to_datetime(latest_edit_time_raw)
-                                        published_at = dt.astimezone(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+                            history_json = await self._fetch_edit_history(page, context, history_url, post_url)
+                            statuses = history_json.get("statuses", [])
+                            if statuses and isinstance(statuses, list):
+                                latest_edit_time_raw = statuses[0].get("created_at")
+                                if latest_edit_time_raw:
+                                    dt = parsedate_to_datetime(latest_edit_time_raw)
+                                    published_at = dt.astimezone(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
                         except Exception as e:
                             print(f"\x1b[1;33m[Scraper Warning] [weibo] 请求 editHistory 失败 ({e})，将降级使用原始时间。\x1b[0m")
                     
@@ -222,4 +297,3 @@ class WeiboScraper(BaseScraper):
             return results
             
         return await self.scrape_flow_handler(_resolve_batch, uids)
-
